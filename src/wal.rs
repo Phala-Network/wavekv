@@ -216,6 +216,7 @@ impl WriteAheadLog {
         writer.write_all(&entry_len.to_le_bytes())?;
         writer.write_all(&entry_bytes)?;
         writer.flush()?;
+        writer.get_ref().sync_all()?;
 
         trace!("Wrote WAL op: sequence={}, op={state_op:?}", self.sequence);
 
