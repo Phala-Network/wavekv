@@ -229,20 +229,36 @@ impl NodeState {
     }
 
     fn execute_ops_impl(&mut self, ops: Vec<StateOp>, write_to_wal: bool) -> Result<()> {
-        // Write to WAL first for durability
-        for op in ops {
-            if self.core.is_noop(&op) {
-                trace!("Skipping noop op: {op:?}");
-                continue;
-            }
-            if write_to_wal {
-                if let Some(wal) = self.wal.as_mut() {
-                    wal.write_op(&op)?;
+        // Filter out noops first
+        let ops: Vec<_> = ops
+            .into_iter()
+            .filter(|op| {
+                if self.core.is_noop(op) {
+                    trace!("Skipping noop op: {op:?}");
+                    false
+                } else {
+                    true
                 }
-            }
-            self.execute_op(op);
-            self.mark_dirty();
+            })
+            .collect();
+
+        if ops.is_empty() {
+            return Ok(());
         }
+
+        // Batch write to WAL first for durability (single fsync)
+        if write_to_wal {
+            if let Some(wal) = self.wal.as_mut() {
+                wal.write_ops(&ops)?;
+            }
+        }
+
+        // Then execute all ops in memory
+        for op in ops {
+            self.execute_op(op);
+        }
+        self.mark_dirty();
+
         Ok(())
     }
 

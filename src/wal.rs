@@ -200,25 +200,35 @@ impl WriteAheadLog {
 
     /// Write a state operation to the WAL
     pub fn write_op(&mut self, state_op: &StateOp) -> Result<()> {
+        self.write_ops(std::slice::from_ref(state_op))
+    }
+
+    /// Write multiple state operations to the WAL in a single fsync
+    pub fn write_ops(&mut self, state_ops: &[StateOp]) -> Result<()> {
+        if state_ops.is_empty() {
+            return Ok(());
+        }
+
         let writer = self
             .writer
             .as_mut()
             .ok_or_else(|| anyhow!("WAL writer not initialized"))?;
 
-        self.sequence += 1;
-        let wal_entry = WalEntry::new(self.sequence, state_op.clone());
+        for state_op in state_ops {
+            self.sequence += 1;
+            let wal_entry = WalEntry::new(self.sequence, state_op.clone());
 
-        // Serialize the entry
-        let entry_bytes = bincode::serialize(&wal_entry)?;
-        let entry_len = entry_bytes.len() as u32;
+            let entry_bytes = bincode::serialize(&wal_entry)?;
+            let entry_len = entry_bytes.len() as u32;
 
-        // Write: [length (4 bytes)] [entry data]
-        writer.write_all(&entry_len.to_le_bytes())?;
-        writer.write_all(&entry_bytes)?;
+            writer.write_all(&entry_len.to_le_bytes())?;
+            writer.write_all(&entry_bytes)?;
+
+            trace!("Wrote WAL op: sequence={}, op={state_op:?}", self.sequence);
+        }
+
         writer.flush()?;
         writer.get_ref().sync_all()?;
-
-        trace!("Wrote WAL op: sequence={}, op={state_op:?}", self.sequence);
 
         Ok(())
     }
