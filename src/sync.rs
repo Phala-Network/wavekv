@@ -100,7 +100,7 @@ impl<Net: ExchangeInterface> SyncManager<Net> {
         }
 
         // Also check the main data store
-        for entry in store.get_all_including_tombstones().values() {
+        for (_, entry) in store.iter_all_including_tombstones() {
             if entry.meta.node == my_id && entry.meta.seq > max_seq_found {
                 max_seq_found = entry.meta.seq;
             }

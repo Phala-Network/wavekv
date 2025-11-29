@@ -411,28 +411,37 @@ impl NodeState {
         self.core.data().get(key).cloned()
     }
 
-    /// Get items by prefix (for range scans)
+    /// Get items by prefix (for range scans) - returns owned data
+    /// For zero-copy iteration, use `iter_by_prefix` instead
     pub fn get_by_prefix(&self, prefix: &str) -> HashMap<String, Entry> {
-        let mut result = HashMap::new();
-
-        // Use BTreeMap's range to efficiently scan by prefix
-        for (k, v) in self.core.data().range(prefix.to_string()..) {
-            if !k.starts_with(prefix) {
-                break;
-            }
-            if v.value.is_some() {
-                result.insert(k.clone(), v.clone());
-            }
-        }
-        result
-    }
-
-    pub fn get_all_including_tombstones(&self) -> HashMap<String, Entry> {
-        self.core
-            .data()
-            .iter()
+        self.iter_by_prefix(prefix)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Iterate items by prefix without cloning (zero-copy)
+    pub fn iter_by_prefix<'a, 'b>(
+        &'a self,
+        prefix: &'b str,
+    ) -> impl Iterator<Item = (&'a String, &'a Entry)> + use<'a, 'b> {
+        self.core
+            .data()
+            .range(prefix.to_string()..)
+            .take_while(move |(k, _)| k.starts_with(prefix))
+            .filter(|(_, v)| v.value.is_some())
+    }
+
+    /// Get all items including tombstones - returns owned data
+    /// For zero-copy iteration, use `iter_all_including_tombstones` instead
+    pub fn get_all_including_tombstones(&self) -> HashMap<String, Entry> {
+        self.iter_all_including_tombstones()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Iterate all items including tombstones without cloning (zero-copy)
+    pub fn iter_all_including_tombstones(&self) -> impl Iterator<Item = (&String, &Entry)> {
+        self.core.data().iter()
     }
 
     pub fn delete(&mut self, key: String) -> Result<Option<Entry>> {
