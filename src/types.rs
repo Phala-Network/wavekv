@@ -132,12 +132,12 @@ impl PartialOrd for Metadata {
 
 impl Ord for Metadata {
     fn cmp(&self, other: &Self) -> Ordering {
-        match self.node.cmp(&other.node) {
-            Ordering::Equal => self.seq.cmp(&other.seq),
-            node_ord => match self.timestamp.cmp(&other.timestamp) {
-                Ordering::Equal => node_ord,
-                timestamp_ord => timestamp_ord,
+        match self.timestamp.cmp(&other.timestamp) {
+            Ordering::Equal => match self.node.cmp(&other.node) {
+                Ordering::Equal => self.seq.cmp(&other.seq),
+                node_ord => node_ord,
             },
+            timestamp_ord => timestamp_ord,
         }
     }
 }
