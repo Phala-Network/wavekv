@@ -140,8 +140,9 @@ impl NodeState {
         let mut reader = BufReader::new(File::open(&path)?);
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
-        let snapshot: SnapshotFile =
-            bincode::deserialize(&buf).context("Failed to deserialize snapshot")?;
+        let (snapshot, _): (SnapshotFile, _) =
+            bincode::serde::decode_from_slice(&buf, bincode::config::standard())
+                .context("Failed to deserialize snapshot")?;
         snapshot.validate(self.id)?;
 
         self.core = snapshot.core;
@@ -157,7 +158,7 @@ impl NodeState {
 
         let tmp_path = snapshot_path.with_extension("snapshot.tmp");
         let snapshot = SnapshotFile::from_state(self);
-        let encoded = bincode::serialize(&snapshot)?;
+        let encoded = bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())?;
 
         {
             let mut writer = BufWriter::new(

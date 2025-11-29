@@ -44,7 +44,8 @@ pub struct WalEntry {
 
 impl WalEntry {
     pub fn new(sequence: u64, state_op: StateOp) -> Self {
-        let serialized = bincode::serialize(&state_op).unwrap_or_default();
+        let serialized = bincode::serde::encode_to_vec(&state_op, bincode::config::standard())
+            .unwrap_or_default();
         let checksum = crc32fast::hash(&serialized);
 
         Self {
@@ -55,7 +56,8 @@ impl WalEntry {
     }
 
     pub fn verify_checksum(&self) -> bool {
-        let serialized = bincode::serialize(&self.state_op).unwrap_or_default();
+        let serialized = bincode::serde::encode_to_vec(&self.state_op, bincode::config::standard())
+            .unwrap_or_default();
         let computed = crc32fast::hash(&serialized);
         computed == self.checksum
     }
@@ -98,7 +100,7 @@ impl WriteAheadLog {
             // New file - write header
             let mut writer = BufWriter::new(file);
             let header = WalHeader::new(self.node_id);
-            let header_bytes = bincode::serialize(&header)?;
+            let header_bytes = bincode::serde::encode_to_vec(&header, bincode::config::standard())?;
             let header_len = header_bytes.len() as u32;
 
             writer.write_all(&header_len.to_le_bytes())?;
@@ -149,7 +151,8 @@ impl WriteAheadLog {
         let mut header_bytes = vec![0u8; header_len as usize];
         reader.read_exact(&mut header_bytes)?;
 
-        let header: WalHeader = bincode::deserialize(&header_bytes)?;
+        let (header, _): (WalHeader, _) =
+            bincode::serde::decode_from_slice(&header_bytes, bincode::config::standard())?;
         Ok(header)
     }
 
@@ -173,7 +176,10 @@ impl WriteAheadLog {
 
                     match reader.read_exact(&mut entry_bytes) {
                         Ok(_) => {
-                            if let Ok(entry) = bincode::deserialize::<WalEntry>(&entry_bytes) {
+                            if let Ok((entry, _)) = bincode::serde::decode_from_slice::<WalEntry, _>(
+                                &entry_bytes,
+                                bincode::config::standard(),
+                            ) {
                                 if entry.verify_checksum() {
                                     last_sequence = entry.sequence;
                                 } else {
@@ -218,7 +224,8 @@ impl WriteAheadLog {
             self.sequence += 1;
             let wal_entry = WalEntry::new(self.sequence, state_op.clone());
 
-            let entry_bytes = bincode::serialize(&wal_entry)?;
+            let entry_bytes =
+                bincode::serde::encode_to_vec(&wal_entry, bincode::config::standard())?;
             let entry_len = entry_bytes.len() as u32;
 
             writer.write_all(&entry_len.to_le_bytes())?;
@@ -279,8 +286,11 @@ impl WriteAheadLog {
                     Err(err).context("Failed to read WAL entry")?;
                 }
             }
-            let wal_entry = bincode::deserialize::<WalEntry>(&entry_bytes)
-                .context("Failed to deserialize WAL entry")?;
+            let (wal_entry, _) = bincode::serde::decode_from_slice::<WalEntry, _>(
+                &entry_bytes,
+                bincode::config::standard(),
+            )
+            .context("Failed to deserialize WAL entry")?;
             if !wal_entry.verify_checksum() {
                 bail!("WAL entry corrupted");
             }
