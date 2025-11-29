@@ -28,7 +28,3 @@ md5 = "0.7"
 
 [dev-dependencies]
 tempfile = "3"
-
-[[bin]]
-name = "node_id_benchmark"
-path = "benches/node_id_benchmark.rs"
