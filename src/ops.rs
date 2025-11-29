@@ -77,13 +77,13 @@ impl CoreState {
     }
 
     fn peer_mut(&mut self, peer_id: NodeId) -> &mut PeerState {
-        self.peers.entry(peer_id).or_insert_with(PeerState::new)
+        self.peers.entry(peer_id).or_default()
     }
 
     pub fn is_noop(&self, op: &StateOp) -> bool {
         match op {
             StateOp::Set(_) => false,
-            StateOp::Clear(key) => self.data.get(key).is_none(),
+            StateOp::Clear(key) => !self.data.contains_key(key),
             StateOp::UpdatePeerAck {
                 peer_id,
                 ack_seq,
@@ -127,8 +127,8 @@ impl CoreState {
             }
             StateOp::IncrementSeq => false,
             StateOp::SetNextSeq(seq) => self.next_seq == *seq,
-            StateOp::AddPeer { peer_id } => self.peers.contains_key(&peer_id),
-            StateOp::RemovePeer { peer_id } => !self.peers.contains_key(&peer_id),
+            StateOp::AddPeer { peer_id } => self.peers.contains_key(peer_id),
+            StateOp::RemovePeer { peer_id } => !self.peers.contains_key(peer_id),
         }
     }
 

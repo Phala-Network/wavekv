@@ -639,7 +639,7 @@ impl NodeState {
 
     /// Get all peer states (for bootstrap scanning)
     pub fn get_all_peer_states(&self) -> &HashMap<NodeId, PeerState> {
-        &self.core.peers()
+        self.core.peers()
     }
 
     fn persist_if_dirty(&mut self) -> Result<bool> {
