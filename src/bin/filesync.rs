@@ -81,7 +81,7 @@ fn encode_file_key(name: &str) -> String {
     format!("{FILE_KEY_PREFIX}{name}")
 }
 
-fn decode_file_key<'a>(key: &'a str) -> Option<&'a str> {
+fn decode_file_key(key: &str) -> Option<&str> {
     key.strip_prefix(FILE_KEY_PREFIX)
 }
 
