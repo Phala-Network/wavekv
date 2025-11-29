@@ -291,13 +291,12 @@ impl NodeState {
             true
         };
 
-        let mut ops = vec![];
         // Always update peer log if this is new
-        ops.push(StateOp::PushPeerLog {
+        let mut ops = vec![StateOp::PushPeerLog {
             peer_id: entry.meta.node,
             entry: entry.clone(),
             max_entries: self.max_log_entries,
-        });
+        }];
 
         if should_update {
             ops.push(StateOp::Set(entry));
