@@ -166,12 +166,12 @@ impl<Net: ExchangeInterface> SyncManager<Net> {
     pub fn handle_sync(&self, msg: SyncMessage) -> Result<SyncResponse> {
         let peer_progress = msg.sender_ack.clone();
         let peer_id = msg.sender_id;
+        let mut state = self.store.write();
         // Step 1: Apply sender's entries (only contains sender_id's logs)
-        self.store.write().apply_pushed_entries(msg)?;
+        state.apply_pushed_entries(msg)?;
         // Step 2: Use sender_ack to determine what to send back
         // Response can include logs from ALL nodes
-        let store = self.store.read();
-        let (entries, is_snapshot) = match store.get_peer_missing_logs(&peer_progress) {
+        let (entries, is_snapshot) = match state.get_peer_missing_logs(&peer_progress) {
             Some(entries) => {
                 info!(
                     "Returning {} incremental log entries to node {peer_id}",
@@ -180,7 +180,7 @@ impl<Net: ExchangeInterface> SyncManager<Net> {
                 (entries, false)
             }
             None => {
-                let entries = store.kv_to_log_entries();
+                let entries = state.kv_to_log_entries();
                 info!(
                     "Returning snapshot ({} entries) to node {peer_id}",
                     entries.len(),
@@ -190,15 +190,13 @@ impl<Net: ExchangeInterface> SyncManager<Net> {
         };
 
         // Step 3: Include our progress so sender can update their peer_ack for us
-        let my_progress = store.get_local_ack();
+        let my_progress = state.get_local_ack();
 
-        // Step 4: Update our peer_ack assuming the peer will accept our logs
-        let my_id = store.id;
+        // Step 4: Update our peer_ack assuming the peer will accept our logs. If the peer
+        //         doesn't accept our logs, it will be updated in the next sync.
+        let my_id = state.id;
         let peer_ack = *my_progress.get(&my_id).unwrap_or(&0);
-
-        drop(store);
-
-        let _ = self.store.write().update_peer_ack(peer_id, peer_ack);
+        let _ = state.update_peer_ack(peer_id, peer_ack);
 
         Ok(SyncResponse {
             peer_id: my_id,

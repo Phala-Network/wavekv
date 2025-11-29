@@ -556,10 +556,11 @@ async fn handle_debug_files(
             if let Ok(metadata) = entry.metadata() {
                 if metadata.is_file() {
                     let name = entry.file_name().to_string_lossy().to_string();
+                    let filekey = encode_file_key(&name);
                     let size = metadata.len();
 
                     let (in_wavekv, wavekv_size, match_status) =
-                        if let Some(kv_entry) = all_entries.get(&name) {
+                        if let Some(kv_entry) = all_entries.get(&filekey) {
                             if let Some(content) = &kv_entry.value {
                                 let fs_content = fs::read(entry.path()).unwrap_or_default();
                                 let matches = fs_content == *content;
