@@ -1,6 +1,7 @@
 use crate::node::Node;
 use crate::types::{Entry, NodeId};
 use anyhow::Result;
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -60,12 +61,22 @@ impl<Net: ExchangeInterface> SyncManager<Net> {
         }
 
         info!("Bootstrapping from {} peers...", peers.len());
-        let mut success_count = 0;
-        let mut max_seq_found = 0u64;
 
-        // Sync from all peers
-        for peer in &peers {
-            match sync_to(self.store.clone(), self.network.clone(), *peer).await {
+        // Sync from all peers in parallel
+        let sync_futures: Vec<_> = peers
+            .iter()
+            .map(|&peer| {
+                let store = self.store.clone();
+                let network = self.network.clone();
+                async move { (peer, sync_to(store, network, peer).await) }
+            })
+            .collect();
+
+        let results = join_all(sync_futures).await;
+
+        let mut success_count = 0;
+        for (peer, result) in results {
+            match result {
                 Ok(_) => {
                     success_count += 1;
                     info!("Successfully bootstrapped from peer {}", peer);
@@ -75,6 +86,8 @@ impl<Net: ExchangeInterface> SyncManager<Net> {
                 }
             }
         }
+
+        let mut max_seq_found = 0u64;
 
         // Scan all received entries to find our highest seq
         let store = self.store.read();
