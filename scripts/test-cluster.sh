@@ -33,7 +33,7 @@ mkdir -p /tmp/filesync-test-node3/data
 
 # Build the project
 echo -e "${BLUE}Building filesync...${NC}"
-cargo build --release --bin filesync
+cargo build --release -p filesync
 
 # Kill existing session if it exists
 tmux kill-session -t $SESSION 2>/dev/null || true
@@ -50,7 +50,7 @@ tmux split-window -v -t $SESSION:0.1
 tmux select-pane -t $SESSION:0.0 -T "Node 1"
 tmux send-keys -t $SESSION:0.0 "cd $REPO_ROOT" C-m
 tmux send-keys -t $SESSION:0.0 "echo 'Starting Node 1 on :8001, watching /tmp/filesync-test-node1/watch'" C-m
-tmux send-keys -t $SESSION:0.0 "RUST_LOG=info,wavekv=debug cargo run --release --bin filesync -- run \
+tmux send-keys -t $SESSION:0.0 "RUST_LOG=info,wavekv=debug cargo run --release -p filesync -- run \
   --id 1 \
   --watch-dir /tmp/filesync-test-node1/watch \
   --data-dir /tmp/filesync-test-node1/data \
@@ -62,7 +62,7 @@ sleep 1
 tmux select-pane -t $SESSION:0.1 -T "Node 2"
 tmux send-keys -t $SESSION:0.1 "cd $REPO_ROOT" C-m
 tmux send-keys -t $SESSION:0.1 "echo 'Starting Node 2 on :8002, watching /tmp/filesync-test-node2/watch'" C-m
-tmux send-keys -t $SESSION:0.1 "RUST_LOG=info,wavekv=debug cargo run --release --bin filesync -- run \
+tmux send-keys -t $SESSION:0.1 "RUST_LOG=info,wavekv=debug cargo run --release -p filesync -- run \
   --id 2 \
   --watch-dir /tmp/filesync-test-node2/watch \
   --data-dir /tmp/filesync-test-node2/data \
@@ -74,7 +74,7 @@ sleep 1
 tmux select-pane -t $SESSION:0.2 -T "Node 3"
 tmux send-keys -t $SESSION:0.2 "cd $REPO_ROOT" C-m
 tmux send-keys -t $SESSION:0.2 "echo 'Starting Node 3 on :8003, watching /tmp/filesync-test-node3/watch'" C-m
-tmux send-keys -t $SESSION:0.2 "RUST_LOG=info,wavekv=debug cargo run --release --bin filesync -- run \
+tmux send-keys -t $SESSION:0.2 "RUST_LOG=info,wavekv=debug cargo run --release -p filesync -- run \
   --id 3 \
   --watch-dir /tmp/filesync-test-node3/watch \
   --data-dir /tmp/filesync-test-node3/data \
@@ -98,7 +98,7 @@ echo ""
 echo "Usage:"
 echo "  - Attach to tmux session: ${BLUE}tmux attach -t $SESSION${NC}"
 echo "  - Run test operations:    ${BLUE}./scripts/test-ops.sh${NC}"
-echo "  - Check consistency:      ${BLUE}cargo run --release --bin filesync -- check --dirs /tmp/filesync-test-node1/watch,/tmp/filesync-test-node2/watch,/tmp/filesync-test-node3/watch${NC}"
+echo "  - Check consistency:      ${BLUE}cargo run --release -p filesync -- check --dirs /tmp/filesync-test-node1/watch,/tmp/filesync-test-node2/watch,/tmp/filesync-test-node3/watch${NC}"
 echo "  - Watch consistency:      ${BLUE}./scripts/check-consistency.sh --watch${NC}"
 echo "  - Stop cluster:           ${BLUE}./scripts/stop-cluster.sh${NC}"
 

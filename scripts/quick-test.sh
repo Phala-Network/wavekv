@@ -33,7 +33,7 @@ sleep 5
 
 echo ""
 echo "4. Checking consistency (files should be synced)..."
-cargo run --release --bin filesync -- check \
+cargo run --release -p filesync -- check \
   --dirs /tmp/filesync-test-node1/watch,/tmp/filesync-test-node2/watch,/tmp/filesync-test-node3/watch
 
 echo ""
@@ -41,7 +41,7 @@ echo "5. Try it yourself:"
 echo "   - View logs:  tmux attach -t filesync-test"
 echo "   - Add files:  echo 'test' > /tmp/filesync-test-node1/watch/myfile.txt"
 echo "   - Run ops:    ./scripts/test-ops.sh"
-echo "   - Check:      cargo run --release --bin filesync -- check --dirs /tmp/filesync-test-node1/watch,/tmp/filesync-test-node2/watch,/tmp/filesync-test-node3/watch"
+echo "   - Check:      cargo run --release -p filesync -- check --dirs /tmp/filesync-test-node1/watch,/tmp/filesync-test-node2/watch,/tmp/filesync-test-node3/watch"
 echo ""
 echo "Press Ctrl+C to stop (cluster will be cleaned up automatically)"
 

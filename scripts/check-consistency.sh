@@ -30,7 +30,7 @@ run_check() {
   echo -e "${BLUE}Checking consistency across all nodes...${NC}"
   echo ""
 
-  cargo run --release --bin filesync -- check \
+  cargo run --release -p filesync -- check \
     --dirs /tmp/filesync-test-node1/watch,/tmp/filesync-test-node2/watch,/tmp/filesync-test-node3/watch
 }
 

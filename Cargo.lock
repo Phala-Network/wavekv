@@ -445,6 +445,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
+name = "filesync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "fs-err",
+ "md5",
+ "notify",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wavekv",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2100,19 +2119,14 @@ name = "wavekv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
  "bincode",
  "chrono",
- "clap",
  "crc32fast",
  "dashmap",
  "fs-err",
  "futures",
  "hex",
- "md5",
- "notify",
  "rand",
- "reqwest",
  "serde",
  "serde_json",
  "sha2",

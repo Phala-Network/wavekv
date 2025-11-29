@@ -47,7 +47,7 @@ echo ""
 # Restart node 1
 echo -e "${BLUE}Step 4: Restarting Node 1...${NC}"
 tmux send-keys -t filesync-test:0.0 "cd $PWD/.." C-m
-tmux send-keys -t filesync-test:0.0 "RUST_LOG=info,wavekv=debug cargo run --release --bin filesync -- run \
+tmux send-keys -t filesync-test:0.0 "RUST_LOG=info,wavekv=debug cargo run --release -p filesync -- run \
   --id 1 \
   --watch-dir /tmp/filesync-test-node1/watch \
   --data-dir /tmp/filesync-test-node1/data \
