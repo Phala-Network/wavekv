@@ -172,9 +172,6 @@ impl NodeState {
             writer.get_ref().sync_all()?;
         }
 
-        if snapshot_path.exists() {
-            fs::remove_file(&snapshot_path)?;
-        }
         fs::rename(&tmp_path, &snapshot_path)?;
 
         if let Some(parent) = snapshot_path.parent() {
