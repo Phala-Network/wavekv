@@ -202,7 +202,7 @@ async fn test_sync_between_stores() {
         .unwrap();
 
     // Sync to store2
-    let updated = store2.write().sync(item1.clone());
+    let updated = store2.write().sync(item1.clone()).unwrap();
     assert!(updated);
 
     // Verify store2 has the item
@@ -237,7 +237,7 @@ async fn test_delete_propagation() {
     assert!(tombstone.value.is_none());
 
     // Sync tombstone to store2
-    store2.write().sync(tombstone);
+    store2.write().sync(tombstone).unwrap();
 
     // Verify store2 also shows the key as deleted
     let result = store2.read().get("key1");
@@ -263,7 +263,7 @@ async fn test_concurrent_writes_resolution() {
         .unwrap();
 
     // item2 has later timestamp, should win
-    store1.write().sync(item2.clone());
+    store1.write().sync(item2.clone()).unwrap();
 
     let final_value = store1.read().get("key1").unwrap();
     assert_eq!(final_value.value, Some(b"value2".to_vec()));
@@ -293,11 +293,11 @@ async fn test_sync_equal_timestamp_tombstone_wins() {
 
     // Start with a put
     let put = Entry::new_put(Metadata::new(1, 1, 1000), "k".into(), b"v".to_vec());
-    store.write().sync(put);
+    store.write().sync(put).unwrap();
 
     // Sync a tombstone with the same timestamp but higher node_id
     let del = Entry::new_delete(Metadata::new(2, 2, 1000), "k".into());
-    let updated = store.write().sync(del);
+    let updated = store.write().sync(del).unwrap();
     assert!(updated);
 
     // The tombstone should win
@@ -499,8 +499,8 @@ async fn test_origin_seq_preservation() {
     assert_eq!(entry2.meta.seq, 2);
 
     // Sync to store2
-    store2.write().sync(entry1.clone());
-    store2.write().sync(entry2.clone());
+    store2.write().sync(entry1.clone()).unwrap();
+    store2.write().sync(entry2.clone()).unwrap();
 
     // Verify seq and node_id preserved
     let retrieved1 = store2.read().get_including_tombstones("key1").unwrap();

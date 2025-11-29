@@ -268,7 +268,7 @@ impl NodeState {
     }
 
     /// Sync an entry from another node (LWW resolution)
-    pub fn sync(&mut self, entry: Entry) -> bool {
+    pub fn sync(&mut self, entry: Entry) -> Result<bool> {
         debug!(entry.key, "Syncing entry, meta: {:?}", entry.meta);
 
         // Check LWW before applying
@@ -289,9 +289,10 @@ impl NodeState {
         if should_update {
             ops.push(StateOp::Set(entry));
         }
-        self.execute_ops(ops).unwrap_or(());
+        self.execute_ops(ops)
+            .context("Failed to execute ops in sync")?;
 
-        should_update
+        Ok(should_update)
     }
 
     /// Update peer_ack: the peer tells us how far they've synced our logs
@@ -323,7 +324,7 @@ impl NodeState {
             self.update_local_ack(&sync_message.progress)?;
         }
         for entry in sync_message.entries {
-            self.sync(entry);
+            self.sync(entry).context("Failed to sync entry")?;
         }
         let peer_ack = sync_message.progress.get(&self.id).copied().unwrap_or(0);
         self.update_peer_ack(sync_message.peer_id, peer_ack)?;
@@ -353,7 +354,7 @@ impl NodeState {
         }
 
         for entry in sync_message.entries {
-            self.sync(entry);
+            self.sync(entry).context("Failed to sync entry")?;
         }
         Ok(())
     }
