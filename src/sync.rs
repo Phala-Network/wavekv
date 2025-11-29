@@ -209,17 +209,18 @@ async fn sync_to<Net: ExchangeInterface>(
     peer: NodeId,
 ) -> Result<()> {
     // Prepare our local_ack to send (tells peer what we've synced)
-    let sender_ack = store.read().get_local_ack();
-
-    // Get only OUR node's log entries that peer hasn't ack'd yet
-    let peer_ack_for_us = store.read().get_peer_state(peer).map_or(0, |p| p.peer_ack);
-
-    let sender_id = store.read().id;
-    // Collect our entries with seq > peer_ack
-    let entries = store
-        .read()
-        .get_peer_logs_since(sender_id, peer_ack_for_us)
-        .unwrap_or_default();
+    let (sender_id, sender_ack, entries) = {
+        let state = store.read();
+        // Get only OUR node's log entries that peer hasn't ack'd yet
+        let peer_ack_for_us = state.get_peer_state(peer).map_or(0, |p| p.peer_ack);
+        let sender_id = state.id;
+        // Collect our entries with seq > peer_ack
+        let entries = state
+            .get_peer_logs_since(sender_id, peer_ack_for_us)
+            .unwrap_or_default();
+        let sender_ack = state.get_local_ack();
+        (sender_id, sender_ack, entries)
+    };
 
     info!("Sending {} log entries to peer {peer}", entries.len());
     // Send bidirectional sync message
