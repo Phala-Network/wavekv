@@ -122,12 +122,8 @@ impl CoreState {
                 let Some(peer_state) = self.peers.get(peer_id) else {
                     return false;
                 };
-                if let Some(last) = peer_state.log.back() {
-                    if last.meta.seq >= entry.meta.seq {
-                        return true;
-                    }
-                }
-                false
+                // Use local_ack for consistency with execute()
+                entry.meta.seq <= peer_state.local_ack
             }
             StateOp::IncrementSeq => false,
             StateOp::SetNextSeq(seq) => self.next_seq == *seq,
@@ -175,10 +171,8 @@ impl CoreState {
                 max_entries,
             } => {
                 let peer_state = self.peer_mut(peer_id);
-                if let Some(last) = peer_state.log.back() {
-                    if last.meta.seq >= entry.meta.seq {
-                        return;
-                    }
+                if entry.meta.seq <= peer_state.local_ack {
+                    return;
                 }
                 peer_state.push(entry.clone(), max_entries);
                 peer_state.local_ack = peer_state.local_ack.max(entry.meta.seq);
