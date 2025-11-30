@@ -73,7 +73,7 @@ enum Commands {
 
 struct SyncManagerState {
     sync_manager: Arc<SyncManager<HttpNetwork>>,
-    node: Arc<Node>,
+    node: Node,
     watch_dir: PathBuf,
 }
 
@@ -85,6 +85,7 @@ fn decode_file_key(key: &str) -> Option<&str> {
     key.strip_prefix(FILE_KEY_PREFIX)
 }
 
+#[derive(Clone)]
 struct HttpNetwork {
     client: reqwest::Client,
 }
@@ -106,7 +107,7 @@ impl HttpNetwork {
     }
 
     /// Register this node's address in DB
-    fn register_node_addr(node: Arc<Node>, my_id: NodeId, my_addr: String) -> Result<()> {
+    fn register_node_addr(node: &Node, my_id: NodeId, my_addr: String) -> Result<()> {
         let key = format!("{PEER_ADDR_PREFIX}{my_id}");
         node.write().put(key, my_addr.into_bytes())?;
         info!("Registered node {} address in DB", my_id);
@@ -115,14 +116,9 @@ impl HttpNetwork {
 }
 
 impl ExchangeInterface for HttpNetwork {
-    async fn sync_to(
-        &self,
-        node: Arc<Node>,
-        peer: NodeId,
-        msg: SyncMessage,
-    ) -> Result<SyncResponse> {
+    async fn sync_to(&self, node: &Node, peer: NodeId, msg: SyncMessage) -> Result<SyncResponse> {
         // Dynamically read peer address from DB
-        let addr = Self::get_peer_addr(&node, peer)
+        let addr = Self::get_peer_addr(node, peer)
             .ok_or_else(|| anyhow::anyhow!("Peer {} address not found in DB", peer))?;
 
         let url = format!("{}/sync", addr);
@@ -197,15 +193,15 @@ async fn run_node(
     info!("Starting filesync node {} watching {:?}", id, watch_dir);
 
     // Initialize wavekv node
-    let node = Arc::new(Node::new_with_persistence(id, peer_ids.clone(), &data_dir)?);
+    let node = Node::new_with_persistence(id, peer_ids.clone(), &data_dir)?;
 
     // Register this node's address in DB
     let my_addr = format!("http://{}", addr);
-    HttpNetwork::register_node_addr(node.clone(), id, my_addr)?;
+    HttpNetwork::register_node_addr(&node, id, my_addr)?;
 
     // Register initial peer addresses in DB (for bootstrapping)
     for (peer_id, peer_addr) in &initial_peer_addrs {
-        HttpNetwork::register_node_addr(node.clone(), *peer_id, peer_addr.clone())?;
+        HttpNetwork::register_node_addr(&node, *peer_id, peer_addr.clone())?;
     }
 
     // Load existing files from watch_dir into wavekv
@@ -223,8 +219,7 @@ async fn run_node(
     watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
 
     // Create SyncManager (network layer reads addresses from DB)
-    let network = Arc::new(HttpNetwork::new());
-    let sync_manager = Arc::new(SyncManager::new(node.clone(), network));
+    let sync_manager = Arc::new(SyncManager::new(node.clone(), HttpNetwork::new()));
 
     let state = Arc::new(SyncManagerState {
         sync_manager: sync_manager.clone(),
@@ -316,7 +311,7 @@ async fn run_node(
     Ok(())
 }
 
-async fn load_initial_files(node: &Arc<Node>, watch_dir: &Path) -> Result<()> {
+async fn load_initial_files(node: &Node, watch_dir: &Path) -> Result<()> {
     let entries = fs::read_dir(watch_dir)?;
 
     for entry in entries {
@@ -337,7 +332,7 @@ async fn load_initial_files(node: &Arc<Node>, watch_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn handle_file_event(node: &Arc<Node>, event: Event) -> Result<()> {
+async fn handle_file_event(node: &Node, event: Event) -> Result<()> {
     match event.kind {
         EventKind::Create(_) | EventKind::Modify(_) => {
             for path in event.paths {
@@ -369,7 +364,7 @@ async fn handle_file_event(node: &Arc<Node>, event: Event) -> Result<()> {
 }
 
 /// Sync all entries from WaveKV to filesystem
-async fn sync_wavekv_to_filesystem(node: &Arc<Node>, watch_dir: &Path) -> Result<()> {
+async fn sync_wavekv_to_filesystem(node: &Node, watch_dir: &Path) -> Result<()> {
     let all_entries = node.read().get_all_including_tombstones();
 
     for (key, entry) in all_entries {

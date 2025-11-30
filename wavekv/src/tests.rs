@@ -369,14 +369,16 @@ async fn test_log_exchange() {
     use anyhow::Result;
 
     // Create a simple mock network handler
+
+    #[derive(Clone)]
     struct TestNetworkHandler {
-        target_store: Arc<Node>,
+        target_store: Node,
     }
 
     impl ExchangeInterface for TestNetworkHandler {
         async fn sync_to(
             &self,
-            _node: Arc<Node>,
+            _node: &Node,
             _peer: u32,
             msg: SyncMessage,
         ) -> Result<SyncResponse> {
@@ -398,8 +400,8 @@ async fn test_log_exchange() {
         }
     }
 
-    let store1 = Arc::new(Node::new(1, vec![2]));
-    let store2 = Arc::new(Node::new(2, vec![1]));
+    let store1 = Node::new(1, vec![2]);
+    let store2 = Node::new(2, vec![1]);
 
     // Store1 writes some data
     store1
@@ -412,10 +414,10 @@ async fn test_log_exchange() {
         .unwrap();
 
     // Create sync managers
-    let network1 = Arc::new(TestNetworkHandler {
+    let network1 = TestNetworkHandler {
         target_store: store2.clone(),
-    });
-    let sync1 = Arc::new(SyncManager::new(store1.clone(), network1));
+    };
+    let sync1 = SyncManager::new(store1.clone(), network1);
 
     // Manually trigger log exchange
     let msg = SyncMessage {

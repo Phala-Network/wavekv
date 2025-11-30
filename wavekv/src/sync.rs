@@ -32,20 +32,20 @@ pub struct SyncResponse {
 pub trait ExchangeInterface: Send + Sync + 'static {
     fn sync_to(
         &self,
-        node: Arc<Node>,
+        node: &Node,
         peer: NodeId,
         msg: SyncMessage,
     ) -> impl Future<Output = Result<SyncResponse>> + Send;
 }
 
 /// Simplified sync manager
-pub struct SyncManager<Net: ExchangeInterface> {
-    store: Arc<Node>,
-    network: Arc<Net>,
+pub struct SyncManager<Net> {
+    store: Node,
+    network: Net,
 }
 
-impl<Net: ExchangeInterface> SyncManager<Net> {
-    pub fn new(store: Arc<Node>, network: Arc<Net>) -> Self {
+impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
+    pub fn new(store: Node, network: Net) -> Self {
         Self { store, network }
     }
 
@@ -214,9 +214,9 @@ impl<Net: ExchangeInterface> SyncManager<Net> {
 /// - Include our sender_ack (progress on all nodes)
 /// - Peer responds with logs from ALL nodes they have
 #[tracing::instrument(skip(store, network))]
-async fn sync_to<Net: ExchangeInterface>(
-    store: Arc<Node>,
-    network: Arc<Net>,
+async fn sync_to<Net: ExchangeInterface + Clone>(
+    store: Node,
+    network: Net,
     peer: NodeId,
 ) -> Result<()> {
     // Prepare our local_ack to send (tells peer what we've synced)
@@ -241,7 +241,7 @@ async fn sync_to<Net: ExchangeInterface>(
         entries,
     };
 
-    match network.sync_to(store.clone(), peer, msg).await {
+    match network.sync_to(&store, peer, msg).await {
         Ok(response) => store.write().apply_pulled_entries(response),
         Err(e) => {
             warn!("Log exchange with peer {peer} failed: {e}");

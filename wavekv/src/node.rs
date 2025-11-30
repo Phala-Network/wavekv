@@ -115,6 +115,7 @@ impl SnapshotFile {
 /// - LWW conflict resolution
 /// - Single RwLock protecting all state for consistency
 /// - BTreeMap for prefix scanning capability
+#[derive(Clone)]
 pub struct Node {
     // All core state protected by single RwLock
     // Includes WAL to ensure atomic updates
