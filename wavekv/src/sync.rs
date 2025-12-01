@@ -13,7 +13,10 @@ use tracing::{info, warn};
 /// Bidirectional sync: sender includes their local_ack AND their new entries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncMessage {
+    /// The unique numeric identifier of the sender node
     pub sender_id: NodeId,
+    /// Optional sender's UUID. This may be used to detect node id duplication
+    pub sender_uuid: Vec<u8>,
     /// How far the sender has synced each node's logs (local_ack)
     pub sender_ack: HashMap<NodeId, u64>,
     /// Sender's new log entries (incremental or full dump)
@@ -30,6 +33,12 @@ pub struct SyncResponse {
 }
 
 pub trait ExchangeInterface: Send + Sync + 'static {
+    fn uuid(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn query_uuid(&self, _node_id: NodeId) -> Option<Vec<u8>> {
+        None
+    }
     fn sync_to(
         &self,
         node: &Node,
@@ -38,51 +47,60 @@ pub trait ExchangeInterface: Send + Sync + 'static {
     ) -> impl Future<Output = Result<SyncResponse>> + Send;
 }
 
+/// Configuration for sync manager
+#[derive(Debug, Clone)]
+pub struct SyncConfig {
+    /// Interval between sync attempts
+    pub interval: Duration,
+    /// Timeout for each sync request
+    pub timeout: Duration,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(10),
+        }
+    }
+}
+
 /// Simplified sync manager
 pub struct SyncManager<Net> {
     store: Node,
-    network: Net,
+    app: Net,
+    config: SyncConfig,
 }
 
 impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
     pub fn new(store: Node, network: Net) -> Self {
-        Self { store, network }
+        Self::with_config(store, network, SyncConfig::default())
+    }
+
+    pub fn with_config(store: Node, network: Net, config: SyncConfig) -> Self {
+        Self {
+            store,
+            app: network,
+            config,
+        }
     }
 
     /// Bootstrap: Sync from all peers and recover next_seq before starting local operations
     /// This is critical after data loss to avoid sequence number reuse
     pub async fn bootstrap(&self) -> Result<()> {
         let my_id = self.store.read().id;
+
         let peers = self.store.read().get_peers();
-
-        if peers.is_empty() {
-            info!("No peers to bootstrap from, starting fresh");
-            return Ok(());
-        }
-
-        info!("Bootstrapping from {} peers...", peers.len());
-
-        // Sync from all peers in parallel
-        let sync_futures: Vec<_> = peers
-            .iter()
-            .map(|&peer| {
-                let store = self.store.clone();
-                let network = self.network.clone();
-                async move { (peer, sync_to(store, network, peer).await) }
-            })
-            .collect();
-
-        let results = join_all(sync_futures).await;
-
+        let results = self.sync_to_all_peers().await;
         let mut success_count = 0;
         for (peer, result) in results {
             match result {
                 Ok(_) => {
                     success_count += 1;
-                    info!("Successfully bootstrapped from peer {}", peer);
+                    info!("Successfully bootstrapped from peer {peer}");
                 }
-                Err(e) => {
-                    warn!("Failed to bootstrap from peer {}: {}", peer, e);
+                Err(err) => {
+                    warn!("Failed to bootstrap from peer {peer}: {err:?}");
                 }
             }
         }
@@ -138,20 +156,21 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
 
     /// Periodic log exchange: send our logs to peers and request their logs
     async fn periodic_log_exchange(&self) {
-        let mut ticker = interval(Duration::from_secs(5));
+        let mut ticker = interval(self.config.interval);
 
         loop {
             ticker.tick().await;
 
-            for peer in self.store.read().get_peers() {
-                let store = self.store.clone();
-                let network = self.network.clone();
-
-                tokio::spawn(async move {
-                    if let Err(e) = sync_to(store, network, peer).await {
-                        warn!("Failed to exchange logs with peer {peer}: {e}");
+            let results = self.sync_to_all_peers().await;
+            for (peer, result) in results {
+                match result {
+                    Ok(_) => {
+                        info!("Successfully synced with peer {peer}");
                     }
-                });
+                    Err(e) => {
+                        warn!("Failed to sync with peer {peer}: {e:?}");
+                    }
+                }
             }
         }
     }
@@ -166,6 +185,16 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
     pub fn handle_sync(&self, msg: SyncMessage) -> Result<SyncResponse> {
         let peer_progress = msg.sender_ack.clone();
         let peer_id = msg.sender_id;
+        if let Some(expected_uuid) = self.app.query_uuid(peer_id) {
+            if expected_uuid != msg.sender_uuid {
+                warn!(
+                    "UUID mismatch for peer {peer_id}: expected {:?}, got {:?}",
+                    hex::encode(expected_uuid),
+                    hex::encode(msg.sender_uuid)
+                );
+                anyhow::bail!("UUID mismatch for peer {peer_id}. Don't reuse node IDs for peers.");
+            }
+        }
         let mut state = self.store.write();
         // Step 1: Apply sender's entries (only contains sender_id's logs)
         state.apply_pushed_entries(msg)?;
@@ -205,47 +234,71 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
             is_snapshot,
         })
     }
-}
 
-/// Perform log exchange with a peer (bidirectional)
-///
-/// Protocol:
-/// - Send only OUR node's logs (entries from store.id)
-/// - Include our sender_ack (progress on all nodes)
-/// - Peer responds with logs from ALL nodes they have
-#[tracing::instrument(skip(store, network))]
-async fn sync_to<Net: ExchangeInterface + Clone>(
-    store: Node,
-    network: Net,
-    peer: NodeId,
-) -> Result<()> {
-    // Prepare our local_ack to send (tells peer what we've synced)
-    let (sender_id, sender_ack, entries) = {
-        let state = store.read();
-        // Get only OUR node's log entries that peer hasn't ack'd yet
-        let peer_ack_for_us = state.get_peer_state(peer).map_or(0, |p| p.peer_ack);
-        let sender_id = state.id;
-        // Collect our entries with seq > peer_ack
-        let entries = state
-            .get_peer_logs_since(sender_id, peer_ack_for_us)
-            .unwrap_or_default();
-        let sender_ack = state.get_local_ack();
-        (sender_id, sender_ack, entries)
-    };
+    /// Perform log exchange with all peers (bidirectional)
+    ///
+    /// Returns Vec of (peer_id, Result<()>)
+    async fn sync_to_all_peers(&self) -> Vec<(NodeId, Result<()>)> {
+        let peers = self.store.read().get_peers();
 
-    info!("Sending {} log entries to peer {peer}", entries.len());
-    // Send bidirectional sync message
-    let msg = SyncMessage {
-        sender_id,
-        sender_ack,
-        entries,
-    };
+        if peers.is_empty() {
+            info!("No peers to bootstrap from, starting fresh");
+            return vec![];
+        }
 
-    match network.sync_to(&store, peer, msg).await {
-        Ok(response) => store.write().apply_pulled_entries(response),
-        Err(e) => {
-            warn!("Log exchange with peer {peer} failed: {e}");
-            Err(e)
+        info!("Syncing with {} peers...", peers.len());
+
+        // Sync from all peers in parallel
+        let sync_futures: Vec<_> = peers
+            .iter()
+            .map(|&peer| async move { (peer, self.sync_to(peer).await) })
+            .collect();
+
+        join_all(sync_futures).await
+    }
+
+    /// Perform log exchange with a peer (bidirectional)
+    ///
+    /// Protocol:
+    /// - Send only OUR node's logs (entries from store.id)
+    /// - Include our sender_ack (progress on all nodes)
+    /// - Peer responds with logs from ALL nodes they have
+    #[tracing::instrument(skip(self))]
+    async fn sync_to(&self, peer: NodeId) -> Result<()> {
+        let timeout = self.config.timeout;
+        // Prepare our local_ack to send (tells peer what we've synced)
+        let (sender_id, sender_ack, entries) = {
+            let state = self.store.read();
+            // Get only OUR node's log entries that peer hasn't ack'd yet
+            let peer_ack_for_us = state.get_peer_state(peer).map_or(0, |p| p.peer_ack);
+            let sender_id = state.id;
+            // Collect our entries with seq > peer_ack
+            let entries = state
+                .get_peer_logs_since(sender_id, peer_ack_for_us)
+                .unwrap_or_default();
+            let sender_ack = state.get_local_ack();
+            (sender_id, sender_ack, entries)
+        };
+
+        info!("Sending {} log entries to peer {peer}", entries.len());
+        // Send bidirectional sync message
+        let msg = SyncMessage {
+            sender_id,
+            sender_uuid: self.app.uuid(),
+            sender_ack,
+            entries,
+        };
+
+        let result = tokio::time::timeout(timeout, self.app.sync_to(&self.store, peer, msg))
+            .await
+            .map_err(|_| anyhow::anyhow!("sync request timed out after {:?}", timeout))?;
+
+        match result {
+            Ok(response) => self.store.write().apply_pulled_entries(response),
+            Err(e) => {
+                warn!("Log exchange with peer {peer} failed: {e}");
+                Err(e)
+            }
         }
     }
 }

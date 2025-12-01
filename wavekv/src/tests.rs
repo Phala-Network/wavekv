@@ -594,3 +594,123 @@ async fn test_kv_to_log_entries() {
     // Should have 3 entries
     assert_eq!(entries.len(), 3);
 }
+
+#[tokio::test]
+async fn test_sync_config_defaults() {
+    use crate::sync::SyncConfig;
+
+    let config = SyncConfig::default();
+    assert_eq!(config.interval, Duration::from_secs(30));
+    assert_eq!(config.timeout, Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn test_sync_manager_with_config() {
+    use crate::sync::{ExchangeInterface, SyncConfig, SyncMessage, SyncResponse};
+    use anyhow::Result;
+
+    #[derive(Clone)]
+    struct TestNetwork {
+        target: Node,
+    }
+
+    impl ExchangeInterface for TestNetwork {
+        async fn sync_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            msg: SyncMessage,
+        ) -> Result<SyncResponse> {
+            self.target.write().apply_pushed_entries(msg.clone())?;
+            let (entries, is_snapshot) = match self.target.read().get_peer_missing_logs(&msg.sender_ack) {
+                Some(e) => (e, false),
+                None => (self.target.read().kv_to_log_entries(), true),
+            };
+            Ok(SyncResponse {
+                peer_id: self.target.read().id,
+                entries,
+                progress: self.target.read().get_local_ack(),
+                is_snapshot,
+            })
+        }
+    }
+
+    let store1 = Node::new(1, vec![2]);
+    let store2 = Node::new(2, vec![1]);
+
+    let config = SyncConfig {
+        interval: Duration::from_millis(100),
+        timeout: Duration::from_secs(5),
+    };
+
+    let network = TestNetwork { target: store2.clone() };
+    let sync = SyncManager::with_config(store1.clone(), network, config);
+
+    // Write data and verify sync works
+    store1.write().put("key".to_string(), "value".to_string()).unwrap();
+
+    let msg = SyncMessage {
+        sender_id: 1,
+        sender_ack: store1.read().get_local_ack(),
+        entries: vec![],
+    };
+    let response = sync.handle_sync(msg).unwrap();
+    assert!(!response.is_snapshot);
+}
+
+#[tokio::test]
+async fn test_sync_timeout() {
+    use crate::sync::{ExchangeInterface, SyncConfig, SyncMessage, SyncResponse};
+    use anyhow::Result;
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct SlowNetwork {
+        delay: Duration,
+        target: Node,
+    }
+
+    impl ExchangeInterface for SlowNetwork {
+        async fn sync_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            msg: SyncMessage,
+        ) -> Result<SyncResponse> {
+            sleep(self.delay).await;
+            self.target.write().apply_pushed_entries(msg.clone())?;
+            Ok(SyncResponse {
+                peer_id: self.target.read().id,
+                entries: vec![],
+                progress: self.target.read().get_local_ack(),
+                is_snapshot: false,
+            })
+        }
+    }
+
+    let store1 = Node::new(1, vec![2]);
+    let store2 = Node::new(2, vec![1]);
+
+    // Set a very short timeout
+    let config = SyncConfig {
+        interval: Duration::from_secs(30),
+        timeout: Duration::from_millis(50),
+    };
+
+    // Network delays longer than timeout
+    let network = SlowNetwork {
+        delay: Duration::from_millis(200),
+        target: store2.clone(),
+    };
+
+    let sync = Arc::new(SyncManager::with_config(store1.clone(), network, config));
+
+    // Write some data so there's something to sync
+    store1.write().put("key".to_string(), "value".to_string()).unwrap();
+
+    // Bootstrap should fail due to timeout (but not panic)
+    let result = sync.bootstrap().await;
+    // Bootstrap doesn't propagate individual peer errors as Result::Err,
+    // it just logs warnings and continues
+    assert!(result.is_ok());
+}
