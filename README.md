@@ -1,6 +1,15 @@
 # WaveKV
 
-WaveKV is a small Rust playground for building a log-driven, eventually consistent key-value store. It focuses on clarity over completeness: there are no transactions, no quorum reads/writes, and conflict resolution is the simplest possible last-writer-wins rule.
+WaveKV is an embeddable Rust library for building distributed key-value stores. It focuses on clarity over completeness.
+
+**Key characteristics:**
+- **Peer-to-peer architecture**: All nodes have equal roles. No leader, no coordinator, no special node types.
+- **No minimum cluster size**: Works with a single node or any number of nodes. Scale freely without reconfiguration.
+- **Last-write-wins conflict resolution**: Conflicts are resolved automatically based on `(timestamp, origin node id)`. Simple and deterministic.
+- **Eventually consistent**: Log-driven replication ensures all nodes converge to the same state. No transactions or quorum reads/writes.
+- **Embeddable library**: Not a standalone application. Designed to be embedded into your Rust programs.
+- **Core only**: Provides the replication algorithm and state management. Network transport is left to the application layer.
+- **In-memory storage**: Keeps all data in memory. Best suited for small to medium datasets that fit in RAM.
 
 ## What it actually does
 
@@ -9,20 +18,21 @@ WaveKV is a small Rust playground for building a log-driven, eventually consiste
 - **Eventual Sync**: Nodes exchange incremental logs plus snapshots when peers fall behind. A background loop keeps trying until it works.
 - **Auto Discovery**: Incoming sync traffic automatically registers the sender as a peer, so a new node can simply point at any existing node and learn about the rest.
 
-None of this is production-grade. There is no authentication, no durability guarantees beyond “fsync the WAL”, and no attempt at transactional isolation.
 
-## Getting started
+## Limitations and Non-goals
 
-```
-git clone https://github.com/kvinwang/wavekv.git
-cd wavekv
+WaveKV intentionally does NOT provide:
 
-cargo fmt
-cargo clippy --all-targets
-cargo test --lib
-```
-
-Those commands build the crate, lint it, and run the current unit tests. Everything else in this repo (WAL tooling, snapshot loader, sync loops) lives under `src/` and can be embedded into your own experiments.
+- **Strong consistency or linearizability**: Only eventual consistency with last-writer-wins based on `(timestamp, origin node id)`.
+- **ACID transactions or CAS**: No transactional isolation, no compare-and-swap operations.
+- **Authentication or access control**: No built-in security mechanisms.
+- **Production-grade durability**: WAL preallocates and fsyncs, but there are no comprehensive checkpoints beyond the snapshot files used by the demo scripts.
+- **Network protocol implementation**: Transport layer is the application's responsibility.
+- **Large dataset support**: In-memory design limits data size to available RAM.
+- **Query language or secondary indexes**: Simple key-value interface only.
+- **Encryption**: No encryption at rest or in transit.
+- **Multi-datacenter replication**: Not optimized for wide-area network scenarios.
+- **Performance optimization**: Clarity and simplicity are prioritized over raw performance.
 
 ## Debug helpers (optional)
 
@@ -32,17 +42,10 @@ There is a `filesync` binary under `src/bin/` that mirrors a local directory int
 cargo build --release --bin filesync
 ./scripts/test-cluster.sh   # launches three demo nodes inside tmux
 ./scripts/test-ops.sh       # generates local file churn
-cargo run --release --bin filesync -- check --dirs DIR1,DIR2,DIR3
 ```
 
 The scripts configure a minimal chain of `--peers` flags so you can watch nodes auto-discover each other via the shared KV store. Feel free to ignore this section if you only care about the embedded library.
 
-## Limitations (by design)
-
-- **No transactions or CAS**: last writer wins, based on `(timestamp, origin node id)`.
-- **Best-effort durability**: WAL preallocates and fsyncs, but there are no checkpoints beyond the snapshot files used by the demo scripts.
-- **Backpressure**: Logs truncate only when all peers acknowledge entries. If a peer disappears forever, logs will grow until you remove it manually.
-
 ## License
 
-MIT License – see `LICENSE` for full text.
+Apache License Version 2.0 – see `LICENSE` for full text.
