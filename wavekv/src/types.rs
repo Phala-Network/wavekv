@@ -1,6 +1,8 @@
 use std::{cmp::Ordering, collections::VecDeque};
 
 use serde::{Deserialize, Serialize};
+
+use serde_human_bytes as serde_bytes;
 // LWW mode: no per-key vector clocks
 
 pub type NodeId = u32;
@@ -58,6 +60,7 @@ impl Default for PeerState {
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
     pub key: String,
+    #[serde(with = "serde_bytes")]
     pub value: Option<Vec<u8>>,
     pub meta: Metadata,
 }
