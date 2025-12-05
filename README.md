@@ -1,6 +1,6 @@
 # WaveKV
 
-WaveKV is an embeddable Rust library for building distributed key-value stores. It focuses on clarity over completeness.
+WaveKV is an embeddable Rust library for building distributed key-value stores. It focuses on simplicity over completeness.
 
 **Key characteristics:**
 - **Peer-to-peer architecture**: All nodes have equal roles. No leader, no coordinator, no special node types.
@@ -32,7 +32,7 @@ WaveKV intentionally does NOT provide:
 - **Query language or secondary indexes**: Simple key-value interface only.
 - **Encryption**: No encryption at rest or in transit.
 - **Multi-datacenter replication**: Not optimized for wide-area network scenarios.
-- **Performance optimization**: Clarity and simplicity are prioritized over raw performance.
+- **Performance optimization**: Simplicity is prioritized over raw performance.
 
 ## Debug helpers (optional)
 

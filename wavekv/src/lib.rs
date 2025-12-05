@@ -1,7 +1,7 @@
 //! WaveKV - An embeddable, eventually consistent, distributed key-value store
 //!
 //! WaveKV is a Rust library that provides a log-driven, eventually consistent,
-//! in-memory distributed key-value store core. It focuses on clarity over completeness.
+//! in-memory distributed key-value store core. It focuses on simplicity over completeness.
 //!
 //! # Key Features
 //!
