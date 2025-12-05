@@ -422,6 +422,7 @@ async fn test_log_exchange() {
     // Manually trigger log exchange
     let msg = SyncMessage {
         sender_id: store1.read().id,
+        sender_uuid: vec![],
         sender_ack: store1.read().get_local_ack(),
         entries: vec![], // Store1 has entries but we're testing the response
     };
@@ -622,10 +623,11 @@ async fn test_sync_manager_with_config() {
             msg: SyncMessage,
         ) -> Result<SyncResponse> {
             self.target.write().apply_pushed_entries(msg.clone())?;
-            let (entries, is_snapshot) = match self.target.read().get_peer_missing_logs(&msg.sender_ack) {
-                Some(e) => (e, false),
-                None => (self.target.read().kv_to_log_entries(), true),
-            };
+            let (entries, is_snapshot) =
+                match self.target.read().get_peer_missing_logs(&msg.sender_ack) {
+                    Some(e) => (e, false),
+                    None => (self.target.read().kv_to_log_entries(), true),
+                };
             Ok(SyncResponse {
                 peer_id: self.target.read().id,
                 entries,
@@ -643,14 +645,20 @@ async fn test_sync_manager_with_config() {
         timeout: Duration::from_secs(5),
     };
 
-    let network = TestNetwork { target: store2.clone() };
+    let network = TestNetwork {
+        target: store2.clone(),
+    };
     let sync = SyncManager::with_config(store1.clone(), network, config);
 
     // Write data and verify sync works
-    store1.write().put("key".to_string(), "value".to_string()).unwrap();
+    store1
+        .write()
+        .put("key".to_string(), "value".to_string())
+        .unwrap();
 
     let msg = SyncMessage {
         sender_id: 1,
+        sender_uuid: vec![],
         sender_ack: store1.read().get_local_ack(),
         entries: vec![],
     };
@@ -706,7 +714,10 @@ async fn test_sync_timeout() {
     let sync = Arc::new(SyncManager::with_config(store1.clone(), network, config));
 
     // Write some data so there's something to sync
-    store1.write().put("key".to_string(), "value".to_string()).unwrap();
+    store1
+        .write()
+        .put("key".to_string(), "value".to_string())
+        .unwrap();
 
     // Bootstrap should fail due to timeout (but not panic)
     let result = sync.bootstrap().await;
