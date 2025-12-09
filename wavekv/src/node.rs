@@ -762,11 +762,13 @@ impl Node {
     }
 
     pub fn write(&self) -> RwLockWriteGuard<NodeState> {
-        self.state.write().expect("Failed to lock store state")
+        #[allow(clippy::expect_used)]
+        self.state.write().expect("lock should never fail")
     }
 
     pub fn read(&self) -> RwLockReadGuard<NodeState> {
-        self.state.read().expect("Failed to lock store state")
+        #[allow(clippy::expect_used)]
+        self.state.read().expect("lock should never fail")
     }
 
     /// Persist current state to disk snapshot (resets WAL)
