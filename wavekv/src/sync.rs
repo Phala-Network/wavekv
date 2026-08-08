@@ -477,6 +477,17 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
         self.store.write().merge_push(env)
     }
 
+    /// Reject a peer presenting an identity that disagrees with the one we have on
+    /// record for its node id.
+    ///
+    /// Deliberately applied to inbound *requests* only, never to responses. A node id
+    /// is configuration while the uuid is derived from local state, so a node whose
+    /// data directory is recreated comes back with the same id and a new uuid — which,
+    /// from here, is indistinguishable from two machines sharing an id. Recovery
+    /// depends on the peer's fresh identity record reaching us, and it can only arrive
+    /// in a response, because our request already fails the peer's own inbound check.
+    /// Checking responses as well closes the last path and the pair never converges
+    /// again. Divergence that slips through is caught by the digest instead.
     fn check_uuid(&self, peer_id: NodeId, presented: &[u8]) -> Result<()> {
         if let Some(expected_uuid) = self.app.query_uuid(peer_id) {
             if expected_uuid != presented {
@@ -556,13 +567,6 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
         let Some(response) = result? else {
             return Ok(false);
         };
-        // The check is symmetric on the v2 wire: the responder stamps its identity in
-        // the same field, so an initiator that skipped this would take data and acks
-        // from any machine that answered on the peer's URL — including one that had
-        // reused the node id, which is the exact failure the uuid exists to catch. (The
-        // v1 `SyncResponse` carries no uuid, so that direction cannot be checked.)
-        self.check_uuid(response.sender_id, &response.sender_uuid)?;
-
         self.update_link(peer, |link| {
             link.protocol = PeerProtocol::V2;
             link.probed_at = Some(Instant::now());
@@ -615,7 +619,6 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
             else {
                 break;
             };
-            self.check_uuid(response.sender_id, &response.sender_uuid)?;
             resume = self.store.write().apply_envelope(response)?.resume_from;
         }
 

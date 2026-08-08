@@ -1689,25 +1689,28 @@ async fn recovery_resumes_after_the_highest_used_seq() {
     );
 }
 
-/// The identity check is symmetric on the v2 wire, or it protects only one side.
+/// A peer whose uuid was regenerated must still be able to converge.
 ///
-/// The responder stamps its uuid into the same field the initiator does. An initiator
-/// that ignored it would adopt data *and* acks from whatever machine answered on the
-/// peer's URL — which is exactly the node-id-reuse case the uuid exists to catch, just
-/// approached from the other direction.
+/// The node id is configuration; the uuid is derived from local state, so a node whose
+/// data directory is recreated returns with the same id and a different uuid. From the
+/// other side that is indistinguishable from two machines sharing an id, and the
+/// inbound check rejects its requests. The only way its fresh identity record reaches
+/// us is inside a *response* to a round we initiated — so responses must not be
+/// subjected to the same check, or the pair is wedged for good.
 #[tokio::test]
-async fn an_impostor_responder_is_rejected_before_its_data_is_applied() {
+async fn a_peer_that_regenerated_its_uuid_can_still_be_pulled_from() {
     use crate::sync::{ExchangeInterface, SyncEnvelope, SyncMessage, SyncResponse};
     use crate::types::{Entry, Metadata};
 
     #[derive(Clone)]
-    struct ImpostorResponder;
+    struct Rotated;
 
-    impl ExchangeInterface for ImpostorResponder {
+    impl ExchangeInterface for Rotated {
         fn uuid(&self) -> Vec<u8> {
             uuid_for(1)
         }
 
+        // What we have on record for peer 2 — stale, because its data dir was recreated.
         fn query_uuid(&self, node_id: NodeId) -> Option<Vec<u8>> {
             Some(uuid_for(node_id))
         }
@@ -1727,12 +1730,12 @@ async fn an_impostor_responder_is_rejected_before_its_data_is_applied() {
             _peer: u32,
             _env: SyncEnvelope,
         ) -> anyhow::Result<Option<SyncEnvelope>> {
-            // Right node id, wrong machine.
-            let mut response = SyncEnvelope::new(2, b"a-different-machine".to_vec());
-            response.acks.insert(1, 99);
+            // Same node id, new identity — and carrying the record that would teach us
+            // the new uuid.
+            let mut response = SyncEnvelope::new(2, b"regenerated-after-a-rebuild".to_vec());
             response.entries.push(Entry::new(
-                "planted".to_string(),
-                Some(b"v".to_vec()),
+                "node/2".to_string(),
+                Some(b"regenerated-after-a-rebuild".to_vec()),
                 Metadata::new(2, 1, 1),
             ));
             Ok(Some(response))
@@ -1740,20 +1743,13 @@ async fn an_impostor_responder_is_rejected_before_its_data_is_applied() {
     }
 
     let local = Node::new(1, vec![2]);
-    let sync = SyncManager::new(local.clone(), ImpostorResponder);
-
-    // Per-peer failures are logged rather than propagated, so the round "succeeds"...
+    let sync = SyncManager::new(local.clone(), Rotated);
     sync.bootstrap().await.unwrap();
 
-    // ...but nothing the impostor sent may have been believed.
     assert!(
-        local.read().get("planted").is_none(),
-        "an unverified responder must not be able to plant data"
-    );
-    assert_eq!(
-        local.read().acks_snapshot().get(&1).copied().unwrap_or(0),
-        0,
-        "nor to move our coverage"
+        local.read().get("node/2").is_some(),
+        "rejecting this response would close the only path by which the peer's new \
+         identity can reach us, and the pair would never converge again"
     );
 }
 
