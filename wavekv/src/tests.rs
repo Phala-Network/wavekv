@@ -19,10 +19,17 @@ async fn test_dynamic_membership() {
     assert_eq!(all_nodes.len(), 3); // self + 2 peers
     assert!(all_nodes.contains(&1));
 
-    // Check peer state
-    let peer2_state = store.read().get_peer_state(2).unwrap();
-    assert_eq!(peer2_state.local_ack, 0);
-    assert_eq!(peer2_state.peer_ack, 0);
+    // A known but never-heard-from peer covers nothing yet.
+    let peer2 = store
+        .read()
+        .status()
+        .peers
+        .into_iter()
+        .find(|p| p.id == 2)
+        .unwrap();
+    assert_eq!(peer2.ack, 0);
+    assert_eq!(peer2.peer_ack, 0);
+    assert!(!peer2.heard_from);
 
     // Add a new peer
     assert!(store.write().add_peer(4).unwrap());
@@ -327,83 +334,93 @@ async fn test_wal_recovery_equal_timestamp_tombstone_wins() {
     assert_eq!(item.value, Some(b"value1".to_vec()));
 }
 
+/// Tombstone GC is gated on replication, not on a local clock.
+///
+/// v1 expired tombstones on a local TTL, which under any state-shipping scheme lets a
+/// lagging replica resurrect a deleted key: it never saw the tombstone, so it re-offers
+/// the original write as live data. The watermark rule makes that impossible.
 #[tokio::test]
-async fn test_tombstone_cleanup() {
-    let store = Node::new(1, vec![]);
+async fn tombstone_gc_waits_for_every_peer_to_cover_the_delete() {
+    use crate::sync::SyncEnvelope;
 
-    // Put and delete a key to create a tombstone
+    let store = Node::new(1, vec![2]);
     store
         .write()
         .put("key1".to_string(), "value1".to_string())
         .unwrap();
     store.write().delete("key1".to_string()).unwrap();
 
-    // Verify tombstone exists
-    assert!(store.read().get_including_tombstones("key1").is_some());
-    assert!(store
-        .read()
-        .get_including_tombstones("key1")
-        .unwrap()
-        .value
-        .is_none());
+    let tombstone = store.read().get_including_tombstones("key1").unwrap();
+    assert!(tombstone.value.is_none());
 
-    // Sleep longer than tombstone TTL
-    sleep(Duration::from_secs(2)).await;
+    // Peer 2 has never reported coverage, so the tombstone is pinned no matter how
+    // much local time passes.
+    assert_eq!(
+        store.write().collect_tombstone_garbage().unwrap(),
+        0,
+        "collecting here would let peer 2 resurrect the key on its next sync"
+    );
 
-    // Clean up expired tombstones
-    let removed = store
+    // Peer 2 now reports covering our writes only up to just before the delete.
+    let mut behind = SyncEnvelope::new(2, vec![]);
+    behind.acks.insert(1, tombstone.meta.seq - 1);
+    store.write().handle_envelope(behind, vec![]).unwrap();
+    assert_eq!(store.write().collect_tombstone_garbage().unwrap(), 0);
+
+    // ... and finally past it.
+    let mut caught_up = SyncEnvelope::new(2, vec![]);
+    caught_up.acks.insert(1, tombstone.meta.seq);
+    store.write().handle_envelope(caught_up, vec![]).unwrap();
+    assert_eq!(store.write().collect_tombstone_garbage().unwrap(), 1);
+    assert!(store.read().get_including_tombstones("key1").is_none());
+}
+
+/// A lone node has nobody to resurrect from, so it may collect immediately.
+#[tokio::test]
+async fn a_single_node_cluster_collects_tombstones_immediately() {
+    let store = Node::new(1, vec![]);
+    store
         .write()
-        .cleanup_expired_tombstones(Duration::from_secs(100))
+        .put("key1".to_string(), "value1".to_string())
         .unwrap();
-    assert_eq!(removed, 0);
-    let removed = store
-        .write()
-        .cleanup_expired_tombstones(Duration::from_secs(0))
-        .unwrap();
-    assert_eq!(removed, 1);
+    store.write().delete("key1".to_string()).unwrap();
+    assert_eq!(store.write().collect_tombstone_garbage().unwrap(), 1);
+}
+
+/// In-process transport that hands envelopes straight to the peer's node. Used by the
+/// tests below to drive real exchanges without a network.
+#[derive(Clone)]
+pub(crate) struct DirectLink {
+    pub(crate) target: Node,
+}
+
+impl crate::sync::ExchangeInterface for DirectLink {
+    async fn sync_to(
+        &self,
+        _node: &Node,
+        _peer: u32,
+        msg: crate::sync::SyncMessage,
+    ) -> anyhow::Result<crate::sync::SyncResponse> {
+        self.target.write().handle_sync_v1(msg)
+    }
+
+    async fn sync_v2_to(
+        &self,
+        _node: &Node,
+        _peer: u32,
+        env: crate::sync::SyncEnvelope,
+    ) -> anyhow::Result<Option<crate::sync::SyncEnvelope>> {
+        Ok(Some(self.target.write().handle_envelope(env, vec![])?))
+    }
 }
 
 #[tokio::test]
-async fn test_log_exchange() {
-    use crate::sync::{ExchangeInterface, SyncMessage, SyncResponse};
-    use anyhow::Result;
-
-    // Create a simple mock network handler
-
-    #[derive(Clone)]
-    struct TestNetworkHandler {
-        target_store: Node,
-    }
-
-    impl ExchangeInterface for TestNetworkHandler {
-        async fn sync_to(
-            &self,
-            _node: &Node,
-            _peer: u32,
-            msg: SyncMessage,
-        ) -> Result<SyncResponse> {
-            let store = self.target_store.clone();
-            store.write().apply_pushed_entries(msg.clone())?;
-            // Determine what to send back
-            let (entries, is_snapshot) = match store.read().get_peer_missing_logs(&msg.sender_ack) {
-                Some(entries) => (entries, false),
-                None => (store.read().kv_to_log_entries(), true),
-            };
-            let progress = store.read().get_local_ack();
-            let peer_id = store.read().id;
-            Ok(SyncResponse {
-                entries,
-                is_snapshot,
-                progress,
-                peer_id,
-            })
-        }
-    }
+async fn a_v2_round_ships_the_delta_and_advances_coverage() {
+    use crate::sync::SyncEnvelope;
 
     let store1 = Node::new(1, vec![2]);
     let store2 = Node::new(2, vec![1]);
 
-    // Store1 writes some data
     store1
         .write()
         .put("key1".to_string(), "value1".to_string())
@@ -413,35 +430,36 @@ async fn test_log_exchange() {
         .put("key2".to_string(), b"value2".to_vec())
         .unwrap();
 
-    // Create sync managers
-    let network1 = TestNetworkHandler {
-        target_store: store2.clone(),
-    };
-    let sync1 = SyncManager::new(store1.clone(), network1);
+    // Node 1 asks node 2 for anything it is missing, and offers its own delta.
+    let request = store1.read().prepare_sync(2, vec![]);
+    assert_eq!(request.entries.len(), 2, "node 2 has covered nothing yet");
 
-    // Manually trigger log exchange
-    let msg = SyncMessage {
-        sender_id: store1.read().id,
-        sender_uuid: vec![],
-        sender_ack: store1.read().get_local_ack(),
-        entries: vec![], // Store1 has entries but we're testing the response
-    };
-    let response = sync1.handle_sync(msg).unwrap();
+    let response = store2.write().handle_envelope(request, vec![]).unwrap();
+    assert!(response.entries.is_empty(), "node 2 has nothing to offer");
 
-    // Verify response contains entries
-    match response {
-        SyncResponse {
-            entries,
-            is_snapshot,
-            progress,
-            peer_id: _,
-        } => {
-            // Store1 has progress (itself), so this should be incremental
-            assert!(!is_snapshot);
-            assert_eq!(entries.len(), 0); // Store2 has no data to send back
-            assert!(progress.contains_key(&2)); // Store2 should report its progress
-        }
-    }
+    // Node 2 merged both entries and adopted node 1's coverage claim.
+    assert_eq!(
+        store2.read().get("key1").unwrap().value,
+        Some(b"value1".to_vec())
+    );
+    assert_eq!(store2.read().acks_snapshot().get(&1).copied(), Some(2));
+
+    let outcome = store1.write().apply_envelope(response).unwrap();
+    assert_eq!(outcome.merged, 0);
+    assert_eq!(
+        outcome.digest_match,
+        Some(true),
+        "both replicas hold the same state, so their digests must agree"
+    );
+
+    // A second round is a no-op: the delta filter now excludes everything.
+    let followup = store1.read().prepare_sync(2, vec![]);
+    assert!(followup.entries.is_empty());
+
+    // An envelope carrying no acks at all is just a bootstrap request.
+    let bootstrap = SyncEnvelope::new(3, vec![]);
+    let full = store2.write().handle_envelope(bootstrap, vec![]).unwrap();
+    assert_eq!(full.entries.len(), 2, "bootstrap is a delta against zero");
 }
 
 #[tokio::test]
@@ -545,40 +563,57 @@ async fn test_wal_recovery_lww() {
     assert_eq!(item.value, Some(b"value2".to_vec()));
 }
 
+/// The delta owed to a partially-covered peer excludes what it already has.
 #[tokio::test]
-async fn test_get_missing_log_entries() {
+async fn a_delta_carries_only_what_the_peer_is_missing() {
+    use crate::sync::SyncEnvelope;
+
     let store = Node::new(1, vec![2]);
+    for key in ["key1", "key2", "key3"] {
+        store.write().put(key.to_string(), b"v".to_vec()).unwrap();
+    }
 
-    // Add some entries
-    store
-        .write()
-        .put("key1".to_string(), "value1".to_string())
-        .unwrap();
-    store
-        .write()
-        .put("key2".to_string(), "value2".to_string())
-        .unwrap();
-    store
-        .write()
-        .put("key3".to_string(), b"value3".to_vec())
-        .unwrap();
+    // Peer 2 reports covering our writes up to seq 1.
+    let mut reported = SyncEnvelope::new(2, vec![]);
+    reported.acks.insert(1, 1);
+    let response = store.write().handle_envelope(reported, vec![]).unwrap();
 
-    // Simulate peer progress
-    let mut peer_progress = std::collections::HashMap::new();
-    peer_progress.insert(1, 1_u64); // Peer has up to seq 1 from node 1
-
-    // Get missing entries
-    let missing = store.read().get_peer_missing_logs(&peer_progress).unwrap();
-
-    // Should have 2 missing entries (seq 2 and 3)
-    assert_eq!(missing.len(), 2);
+    assert_eq!(response.entries.len(), 2, "seq 2 and 3 remain outstanding");
+    assert!(response.entries.iter().all(|e| e.meta.seq > 1));
 }
 
+/// Superseded writes are never shipped: v1 sent every intermediate version of a key,
+/// v2 sends only the survivor.
 #[tokio::test]
-async fn test_kv_to_log_entries() {
-    let store = Node::new(1, vec![]);
+async fn overwrites_collapse_instead_of_replaying_every_version() {
+    use crate::sync::SyncEnvelope;
 
-    // Add some data
+    let store = Node::new(1, vec![2]);
+    for i in 0..10 {
+        store
+            .write()
+            .put("hot".to_string(), format!("v{i}").into_bytes())
+            .unwrap();
+    }
+
+    let response = store
+        .write()
+        .handle_envelope(SyncEnvelope::new(2, vec![]), vec![])
+        .unwrap();
+    assert_eq!(
+        response.entries.len(),
+        1,
+        "ten writes to one key collapse to the single winning entry"
+    );
+    assert_eq!(response.entries[0].value, Some(b"v9".to_vec()));
+}
+
+/// A full dump is the same code path as an incremental delta, with an empty ack map.
+#[tokio::test]
+async fn a_bootstrap_delta_includes_tombstones() {
+    use crate::sync::SyncEnvelope;
+
+    let store = Node::new(1, vec![]);
     store
         .write()
         .put("key1".to_string(), "value1".to_string())
@@ -589,11 +624,16 @@ async fn test_kv_to_log_entries() {
         .unwrap();
     store.write().delete("key3".to_string()).unwrap();
 
-    // Convert to log entries
-    let entries = store.read().kv_to_log_entries();
-
-    // Should have 3 entries
-    assert_eq!(entries.len(), 3);
+    let response = store
+        .write()
+        .handle_envelope(SyncEnvelope::new(9, vec![]), vec![])
+        .unwrap();
+    assert_eq!(response.entries.len(), 3);
+    assert_eq!(
+        response.entries.iter().filter(|e| e.is_deleted()).count(),
+        1,
+        "a tombstone the new node never learns about is a resurrection waiting to happen"
+    );
 }
 
 #[tokio::test]
@@ -606,69 +646,50 @@ async fn test_sync_config_defaults() {
 }
 
 #[tokio::test]
-async fn test_sync_manager_with_config() {
-    use crate::sync::{ExchangeInterface, SyncConfig, SyncMessage, SyncResponse};
-    use anyhow::Result;
-
-    #[derive(Clone)]
-    struct TestNetwork {
-        target: Node,
-    }
-
-    impl ExchangeInterface for TestNetwork {
-        async fn sync_to(
-            &self,
-            _node: &Node,
-            _peer: u32,
-            msg: SyncMessage,
-        ) -> Result<SyncResponse> {
-            self.target.write().apply_pushed_entries(msg.clone())?;
-            let (entries, is_snapshot) =
-                match self.target.read().get_peer_missing_logs(&msg.sender_ack) {
-                    Some(e) => (e, false),
-                    None => (self.target.read().kv_to_log_entries(), true),
-                };
-            Ok(SyncResponse {
-                peer_id: self.target.read().id,
-                entries,
-                progress: self.target.read().get_local_ack(),
-                is_snapshot,
-            })
-        }
-    }
+async fn a_sync_manager_round_converges_two_nodes() {
+    use crate::sync::SyncConfig;
 
     let store1 = Node::new(1, vec![2]);
     let store2 = Node::new(2, vec![1]);
 
-    let config = SyncConfig {
-        interval: Duration::from_millis(100),
-        timeout: Duration::from_secs(5),
-    };
+    let sync = SyncManager::with_config(
+        store1.clone(),
+        DirectLink {
+            target: store2.clone(),
+        },
+        SyncConfig {
+            interval: Duration::from_millis(100),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        },
+    );
 
-    let network = TestNetwork {
-        target: store2.clone(),
-    };
-    let sync = SyncManager::with_config(store1.clone(), network, config);
-
-    // Write data and verify sync works
     store1
         .write()
         .put("key".to_string(), "value".to_string())
         .unwrap();
+    store2
+        .write()
+        .put("other".to_string(), "value".to_string())
+        .unwrap();
 
-    let msg = SyncMessage {
-        sender_id: 1,
-        sender_uuid: vec![],
-        sender_ack: store1.read().get_local_ack(),
-        entries: vec![],
-    };
-    let response = sync.handle_sync(msg).unwrap();
-    assert!(!response.is_snapshot);
+    sync.bootstrap().await.unwrap();
+
+    assert_eq!(store1.state_digest(), store2.state_digest());
+    assert!(store1.read().get("other").is_some());
+    assert!(store2.read().get("key").is_some());
+    assert_eq!(
+        sync.link_status()
+            .iter()
+            .find(|s| s.id == 2)
+            .map(|s| s.protocol),
+        Some("v2")
+    );
 }
 
 #[tokio::test]
-async fn test_sync_timeout() {
-    use crate::sync::{ExchangeInterface, SyncConfig, SyncMessage, SyncResponse};
+async fn a_slow_peer_times_out_without_panicking() {
+    use crate::sync::{ExchangeInterface, SyncConfig, SyncEnvelope, SyncMessage, SyncResponse};
     use anyhow::Result;
     use std::sync::Arc;
 
@@ -686,42 +707,41 @@ async fn test_sync_timeout() {
             msg: SyncMessage,
         ) -> Result<SyncResponse> {
             sleep(self.delay).await;
-            self.target.write().apply_pushed_entries(msg.clone())?;
-            Ok(SyncResponse {
-                peer_id: self.target.read().id,
-                entries: vec![],
-                progress: self.target.read().get_local_ack(),
-                is_snapshot: false,
-            })
+            self.target.write().handle_sync_v1(msg)
+        }
+
+        async fn sync_v2_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            env: SyncEnvelope,
+        ) -> Result<Option<SyncEnvelope>> {
+            sleep(self.delay).await;
+            Ok(Some(self.target.write().handle_envelope(env, vec![])?))
         }
     }
 
     let store1 = Node::new(1, vec![2]);
     let store2 = Node::new(2, vec![1]);
 
-    // Set a very short timeout
-    let config = SyncConfig {
-        interval: Duration::from_secs(30),
-        timeout: Duration::from_millis(50),
-    };
+    let sync = Arc::new(SyncManager::with_config(
+        store1.clone(),
+        SlowNetwork {
+            delay: Duration::from_millis(200),
+            target: store2.clone(),
+        },
+        SyncConfig {
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_millis(50),
+            ..Default::default()
+        },
+    ));
 
-    // Network delays longer than timeout
-    let network = SlowNetwork {
-        delay: Duration::from_millis(200),
-        target: store2.clone(),
-    };
-
-    let sync = Arc::new(SyncManager::with_config(store1.clone(), network, config));
-
-    // Write some data so there's something to sync
     store1
         .write()
         .put("key".to_string(), "value".to_string())
         .unwrap();
 
-    // Bootstrap should fail due to timeout (but not panic)
-    let result = sync.bootstrap().await;
-    // Bootstrap doesn't propagate individual peer errors as Result::Err,
-    // it just logs warnings and continues
-    assert!(result.is_ok());
+    // Bootstrap logs per-peer failures and continues rather than propagating them.
+    assert!(sync.bootstrap().await.is_ok());
 }
