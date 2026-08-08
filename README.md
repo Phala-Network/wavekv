@@ -6,7 +6,7 @@ WaveKV is an embeddable Rust library for building distributed key-value stores. 
 - **Peer-to-peer architecture**: All nodes have equal roles. No leader, no coordinator, no special node types.
 - **No minimum cluster size**: Works with a single node or any number of nodes. Scale freely without reconfiguration.
 - **Last-write-wins conflict resolution**: Conflicts are resolved automatically based on `(timestamp, origin node id)`. Simple and deterministic.
-- **Eventually consistent**: Log-driven replication ensures all nodes converge to the same state. No transactions or quorum reads/writes.
+- **Eventually consistent**: Delta-state replication ensures all nodes converge to the same state. No transactions or quorum reads/writes.
 - **Embeddable library**: Not a standalone application. Designed to be embedded into your Rust programs.
 - **Core only**: Provides the replication algorithm and state management. Network transport is left to the application layer.
 - **In-memory storage**: Keeps all data in memory. Best suited for small to medium datasets that fit in RAM.
@@ -14,8 +14,8 @@ WaveKV is an embeddable Rust library for building distributed key-value stores. 
 ## What it actually does
 
 - **Single Source of Truth**: Every mutation becomes a `StateOp` and is appended to a write-ahead log (WAL). Recovery replays the exact same ops.
-- **Simple Core State**: `CoreState` only tracks three things—KV data, peer metadata (logs + ack progress), and `next_seq`.
-- **Eventual Sync**: Nodes exchange incremental logs plus snapshots when peers fall behind. A background loop keeps trying until it works.
+- **Simple Core State**: `CoreState` tracks the KV data, a secondary `(origin, seq) -> key` index over it, per-origin ack progress, and `next_seq`. There is no second copy of any entry.
+- **Eventual Sync**: Nodes exchange *deltas* — the subset of live entries a peer has not yet covered, computed by filtering the data map against that peer's ack map. Bootstrap is the same operation against an empty ack map, so there is no separate full-dump path. A background loop keeps trying until it works, and a state digest detects any replica that has silently diverged.
 - **Auto Discovery**: Incoming sync traffic automatically registers the sender as a peer, so a new node can simply point at any existing node and learn about the rest.
 
 
