@@ -206,6 +206,67 @@ mod tests {
         );
     }
 
+    /// The byte budget, pinned to an exact boundary.
+    ///
+    /// Entry-count paging was covered; the byte arithmetic was not, and "roughly the
+    /// right number of entries came back" is satisfied by almost any weighting. Sizing
+    /// each entry to weigh exactly 100 and setting the budget to exactly 200 makes the
+    /// page break observable to the byte: two entries fit, the third does not, and the
+    /// case `bytes + weight == max_bytes` is exercised rather than stepped over.
+    #[test]
+    fn the_byte_budget_breaks_the_page_at_an_exact_boundary() {
+        // entry_weight = key.len() + value.len() + 32 = 2 + 66 + 32 = 100
+        let sized = |key: &str, seq: u64| {
+            Entry::new(
+                key.to_string(),
+                Some(vec![0u8; 66]),
+                Metadata::new(1, seq, seq as i64),
+            )
+        };
+        assert_eq!(
+            entry_weight(&sized("ab", 1)),
+            100,
+            "the fixture below is calibrated to this weight"
+        );
+
+        let (data, index) = build(vec![
+            sized("ab", 1),
+            sized("cd", 2),
+            sized("ef", 3),
+            sized("gh", 4),
+        ]);
+
+        // Budget 200 admits exactly two: the second lands on `bytes + weight == 200`,
+        // which must still fit, and the third would reach 300, which must not.
+        let delta = compute_delta(&data, &index, &HashMap::new(), None, usize::MAX, 200);
+        assert_eq!(
+            delta.entries.len(),
+            2,
+            "an entry landing exactly on the budget still fits"
+        );
+        assert!(
+            !delta.permits_ack_adoption(),
+            "a truncated page is not final"
+        );
+
+        // Resuming picks up exactly where it stopped, still two at a time.
+        let page = delta.page.expect("the scan was truncated");
+        let next = compute_delta(
+            &data,
+            &index,
+            &HashMap::new(),
+            Some(page.cursor),
+            usize::MAX,
+            200,
+        );
+        assert_eq!(next.entries.len(), 2);
+        assert_eq!(
+            next.entries.first().map(|e| e.key.as_str()),
+            Some("ef"),
+            "the resumed page starts after the last included entry"
+        );
+    }
+
     #[test]
     fn pagination_resumes_without_loss_or_repetition() {
         let all: Vec<Entry> = (1..=10).map(|i| entry(&format!("k{i}"), 1, i)).collect();

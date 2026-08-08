@@ -175,6 +175,21 @@ mod tests {
             limits.check_entry(&entry("k", vec![0; 4], 0)),
             Admission::Accept
         );
+        // Both limits are inclusive, and only a fixture sitting exactly on them can
+        // tell `>` from `>=`. Testing "well over" and "well under" leaves the boundary
+        // itself free to move by one in either direction.
+        assert_eq!(
+            limits.check_entry(&entry("abcd", vec![], 0)),
+            Admission::Accept,
+            "a key of exactly max_key_bytes is admissible"
+        );
+        assert_eq!(
+            limits.check_entry(&entry("abcde", vec![], 0)),
+            Admission::Reject {
+                reason: "key exceeds max_key_bytes"
+            },
+            "one byte over is not"
+        );
     }
 
     #[test]
@@ -198,6 +213,19 @@ mod tests {
             limits.check_clock(&entry("k", vec![], 0), now),
             Admission::Accept,
             "an old entry simply loses LWW; it needs no clock guard"
+        );
+        // The inclusive edge: drift *equal* to the limit is still within tolerance.
+        assert_eq!(
+            limits.check_clock(&entry("k", vec![], now + 60_000), now),
+            Admission::Accept,
+            "a stamp exactly max_clock_drift ahead is still admissible"
+        );
+        assert_eq!(
+            limits.check_clock(&entry("k", vec![], now + 60_001), now),
+            Admission::Reject {
+                reason: "timestamp exceeds max_clock_drift"
+            },
+            "one millisecond past it is not"
         );
     }
 

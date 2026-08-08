@@ -11,6 +11,76 @@ fn uuid_for(node: NodeId) -> Vec<u8> {
     format!("uuid-of-node-{node}").into_bytes()
 }
 
+/// The peer's *server side*, entered where a real request enters it.
+///
+/// `SyncManager` is the receive-side boundary: `check_uuid` runs there, and so will
+/// anything added to it later. A double that reaches past it into `NodeState` cannot
+/// observe those guards — which is exactly how an envelope that was never stamped with
+/// a `sender_uuid` went unnoticed. Transports in these tests therefore hold a
+/// `PeerEndpoint` rather than a bare `Node`.
+#[derive(Clone)]
+pub(crate) struct PeerEndpoint {
+    manager: Arc<SyncManager<Answering>>,
+    node: Node,
+}
+
+/// The endpoint answers; it never initiates. Its `query_uuid` is populated so the
+/// identity check is live, as it is for any real embedder that implements it.
+#[derive(Clone)]
+struct Answering(NodeId);
+
+impl crate::sync::ExchangeInterface for Answering {
+    fn uuid(&self) -> Vec<u8> {
+        uuid_for(self.0)
+    }
+
+    fn query_uuid(&self, node_id: NodeId) -> Option<Vec<u8>> {
+        Some(uuid_for(node_id))
+    }
+
+    async fn sync_to(
+        &self,
+        _node: &Node,
+        _peer: NodeId,
+        _msg: crate::sync::SyncMessage,
+    ) -> anyhow::Result<crate::sync::SyncResponse> {
+        anyhow::bail!("a peer endpoint answers requests; it never sends them")
+    }
+}
+
+impl PeerEndpoint {
+    pub(crate) fn new(id: NodeId, peers: Vec<NodeId>) -> Self {
+        let node = Node::new(id, peers);
+        Self {
+            manager: Arc::new(SyncManager::new(node.clone(), Answering(id))),
+            node,
+        }
+    }
+
+    /// The peer's store, for seeding fixtures and asserting outcomes.
+    pub(crate) fn node(&self) -> &Node {
+        &self.node
+    }
+
+    pub(crate) fn handle_sync_v1(
+        &self,
+        msg: crate::sync::SyncMessage,
+    ) -> anyhow::Result<crate::sync::SyncResponse> {
+        self.manager.handle_sync(msg)
+    }
+
+    pub(crate) fn handle_envelope(
+        &self,
+        env: crate::sync::SyncEnvelope,
+    ) -> anyhow::Result<crate::sync::SyncEnvelope> {
+        self.manager.handle_envelope(env)
+    }
+
+    pub(crate) fn handle_push(&self, env: crate::sync::SyncEnvelope) -> anyhow::Result<()> {
+        self.manager.handle_push(env)
+    }
+}
+
 #[tokio::test]
 async fn test_dynamic_membership() {
     let store = Node::new(1, vec![2, 3]);
@@ -457,21 +527,30 @@ async fn a_single_node_cluster_collects_tombstones_immediately() {
     assert_eq!(store.write().collect_tombstone_garbage().unwrap(), 1);
 }
 
-/// In-process transport that hands envelopes straight to the peer's node. Used by the
-/// tests below to drive real exchanges without a network.
+/// In-process transport that hands envelopes to the peer's receive boundary. Used by
+/// the tests below to drive real exchanges without a network.
 #[derive(Clone)]
 pub(crate) struct DirectLink {
-    pub(crate) target: Node,
+    pub(crate) me: NodeId,
+    pub(crate) target: PeerEndpoint,
 }
 
 impl crate::sync::ExchangeInterface for DirectLink {
+    fn uuid(&self) -> Vec<u8> {
+        uuid_for(self.me)
+    }
+
+    fn query_uuid(&self, node_id: NodeId) -> Option<Vec<u8>> {
+        Some(uuid_for(node_id))
+    }
+
     async fn sync_to(
         &self,
         _node: &Node,
         _peer: u32,
         msg: crate::sync::SyncMessage,
     ) -> anyhow::Result<crate::sync::SyncResponse> {
-        self.target.write().handle_sync_v1(msg)
+        self.target.handle_sync_v1(msg)
     }
 
     async fn sync_v2_to(
@@ -480,7 +559,7 @@ impl crate::sync::ExchangeInterface for DirectLink {
         _peer: u32,
         env: crate::sync::SyncEnvelope,
     ) -> anyhow::Result<Option<crate::sync::SyncEnvelope>> {
-        Ok(Some(self.target.write().handle_envelope(env, vec![])?))
+        Ok(Some(self.target.handle_envelope(env)?))
     }
 }
 
@@ -720,11 +799,12 @@ async fn a_sync_manager_round_converges_two_nodes() {
     use crate::sync::SyncConfig;
 
     let store1 = Node::new(1, vec![2]);
-    let store2 = Node::new(2, vec![1]);
+    let store2 = PeerEndpoint::new(2, vec![1]);
 
     let sync = SyncManager::with_config(
         store1.clone(),
         DirectLink {
+            me: 1,
             target: store2.clone(),
         },
         SyncConfig {
@@ -739,15 +819,16 @@ async fn a_sync_manager_round_converges_two_nodes() {
         .put("key".to_string(), "value".to_string())
         .unwrap();
     store2
+        .node()
         .write()
         .put("other".to_string(), "value".to_string())
         .unwrap();
 
     sync.bootstrap().await.unwrap();
 
-    assert_eq!(store1.state_digest(), store2.state_digest());
+    assert_eq!(store1.state_digest(), store2.node().state_digest());
     assert!(store1.read().get("other").is_some());
-    assert!(store2.read().get("key").is_some());
+    assert!(store2.node().read().get("key").is_some());
     let status = sync
         .link_status()
         .into_iter()
@@ -769,10 +850,14 @@ async fn a_slow_peer_times_out_without_panicking() {
     #[derive(Clone)]
     struct SlowNetwork {
         delay: Duration,
-        target: Node,
+        target: PeerEndpoint,
     }
 
     impl ExchangeInterface for SlowNetwork {
+        fn uuid(&self) -> Vec<u8> {
+            uuid_for(1)
+        }
+
         async fn sync_to(
             &self,
             _node: &Node,
@@ -780,7 +865,7 @@ async fn a_slow_peer_times_out_without_panicking() {
             msg: SyncMessage,
         ) -> Result<SyncResponse> {
             sleep(self.delay).await;
-            self.target.write().handle_sync_v1(msg)
+            self.target.handle_sync_v1(msg)
         }
 
         async fn sync_v2_to(
@@ -790,12 +875,12 @@ async fn a_slow_peer_times_out_without_panicking() {
             env: SyncEnvelope,
         ) -> Result<Option<SyncEnvelope>> {
             sleep(self.delay).await;
-            Ok(Some(self.target.write().handle_envelope(env, vec![])?))
+            Ok(Some(self.target.handle_envelope(env)?))
         }
     }
 
     let store1 = Node::new(1, vec![2]);
-    let store2 = Node::new(2, vec![1]);
+    let store2 = PeerEndpoint::new(2, vec![1]);
 
     let sync = Arc::new(SyncManager::with_config(
         store1.clone(),
@@ -889,12 +974,16 @@ async fn a_peer_without_the_v2_route_falls_back_to_v1() {
 
     #[derive(Clone)]
     struct V1Only {
-        target: Node,
+        target: PeerEndpoint,
         v2_probes: Arc<AtomicUsize>,
         v1_rounds: Arc<AtomicUsize>,
     }
 
     impl ExchangeInterface for V1Only {
+        fn uuid(&self) -> Vec<u8> {
+            uuid_for(1)
+        }
+
         async fn sync_to(
             &self,
             _node: &Node,
@@ -902,7 +991,7 @@ async fn a_peer_without_the_v2_route_falls_back_to_v1() {
             msg: SyncMessage,
         ) -> anyhow::Result<SyncResponse> {
             self.v1_rounds.fetch_add(1, Ordering::SeqCst);
-            self.target.write().handle_sync_v1(msg)
+            self.target.handle_sync_v1(msg)
         }
 
         async fn sync_v2_to(
@@ -917,8 +1006,9 @@ async fn a_peer_without_the_v2_route_falls_back_to_v1() {
     }
 
     let local = Node::new(1, vec![2]);
-    let remote = Node::new(2, vec![1]);
+    let remote = PeerEndpoint::new(2, vec![1]);
     remote
+        .node()
         .write()
         .put("remote".to_string(), b"v".to_vec())
         .unwrap();
@@ -1059,18 +1149,22 @@ async fn an_upgraded_peer_is_picked_up_after_the_reprobe_window() {
 
     #[derive(Clone)]
     struct Upgradable {
-        target: Node,
+        target: PeerEndpoint,
         speaks_v2: Arc<AtomicBool>,
     }
 
     impl ExchangeInterface for Upgradable {
+        fn uuid(&self) -> Vec<u8> {
+            uuid_for(1)
+        }
+
         async fn sync_to(
             &self,
             _node: &Node,
             _peer: u32,
             msg: SyncMessage,
         ) -> anyhow::Result<SyncResponse> {
-            self.target.write().handle_sync_v1(msg)
+            self.target.handle_sync_v1(msg)
         }
 
         async fn sync_v2_to(
@@ -1082,12 +1176,12 @@ async fn an_upgraded_peer_is_picked_up_after_the_reprobe_window() {
             if !self.speaks_v2.load(Ordering::SeqCst) {
                 return Ok(None);
             }
-            Ok(Some(self.target.write().handle_envelope(env, vec![])?))
+            Ok(Some(self.target.handle_envelope(env)?))
         }
     }
 
     let local = Node::new(1, vec![2]);
-    let remote = Node::new(2, vec![1]);
+    let remote = PeerEndpoint::new(2, vec![1]);
     let speaks_v2 = Arc::new(AtomicBool::new(false));
 
     let sync = SyncManager::with_config(
@@ -1138,11 +1232,12 @@ async fn persistently_mismatched_digests_trigger_an_automatic_repair() {
     use crate::sync::{SyncConfig, SyncEnvelope};
 
     let a = Node::new(1, vec![2]);
-    let b = Node::new(2, vec![1]);
+    let b = PeerEndpoint::new(2, vec![1]);
     a.write()
         .put("only-on-a".to_string(), b"1".to_vec())
         .unwrap();
-    b.write()
+    b.node()
+        .write()
         .put("only-on-b".to_string(), b"2".to_vec())
         .unwrap();
 
@@ -1159,9 +1254,13 @@ async fn persistently_mismatched_digests_trigger_an_automatic_repair() {
     a.write().handle_envelope(from_b, vec![]).unwrap();
     let mut from_a = full_coverage();
     from_a.sender_id = 1;
-    b.write().handle_envelope(from_a, vec![]).unwrap();
+    b.node().write().handle_envelope(from_a, vec![]).unwrap();
 
-    assert_ne!(a.state_digest(), b.state_digest(), "the two have diverged");
+    assert_ne!(
+        a.state_digest(),
+        b.node().state_digest(),
+        "the two have diverged"
+    );
     assert!(
         a.read().prepare_sync(2, vec![]).entries.is_empty(),
         "and neither has anything to send, so v1 would never notice"
@@ -1169,7 +1268,10 @@ async fn persistently_mismatched_digests_trigger_an_automatic_repair() {
 
     let sync = SyncManager::with_config(
         a.clone(),
-        DirectLink { target: b.clone() },
+        DirectLink {
+            me: 1,
+            target: b.clone(),
+        },
         SyncConfig {
             digest_check_rounds: 2,
             ..Default::default()
@@ -1182,11 +1284,11 @@ async fn persistently_mismatched_digests_trigger_an_automatic_repair() {
 
     assert_eq!(
         a.state_digest(),
-        b.state_digest(),
+        b.node().state_digest(),
         "the digest mismatch must escalate to a full re-exchange and converge"
     );
     assert!(a.read().get("only-on-b").is_some());
-    assert!(b.read().get("only-on-a").is_some());
+    assert!(b.node().read().get("only-on-a").is_some());
     assert_eq!(
         sync.link_status()
             .iter()
@@ -1259,38 +1361,8 @@ async fn a_local_write_reaches_the_peer_through_the_push_channel() {
     // implement `query_uuid`, because the check is opt-in and a transport that leaves
     // it at the default `None` cannot fail it either.
     #[derive(Clone)]
-    struct DeadLink {
-        me: NodeId,
-    }
-
-    impl ExchangeInterface for DeadLink {
-        fn uuid(&self) -> Vec<u8> {
-            uuid_for(self.me)
-        }
-        fn query_uuid(&self, node_id: NodeId) -> Option<Vec<u8>> {
-            Some(uuid_for(node_id))
-        }
-        async fn sync_to(
-            &self,
-            _node: &Node,
-            _peer: u32,
-            _msg: SyncMessage,
-        ) -> anyhow::Result<SyncResponse> {
-            anyhow::bail!("the periodic round is disabled for this test")
-        }
-        async fn sync_v2_to(
-            &self,
-            _node: &Node,
-            _peer: u32,
-            _env: SyncEnvelope,
-        ) -> anyhow::Result<Option<SyncEnvelope>> {
-            anyhow::bail!("the periodic round is disabled for this test")
-        }
-    }
-
-    #[derive(Clone)]
     struct PushLink {
-        target: Arc<SyncManager<DeadLink>>,
+        target: PeerEndpoint,
     }
 
     // Both sync legs are dead, so anything that reaches the peer can only have
@@ -1326,13 +1398,12 @@ async fn a_local_write_reaches_the_peer_through_the_push_channel() {
     }
 
     let local = Node::new(1, vec![2]);
-    let remote = Node::new(2, vec![1]);
-    let remote_sync = Arc::new(SyncManager::new(remote.clone(), DeadLink { me: 2 }));
+    let remote = PeerEndpoint::new(2, vec![1]);
 
     let sync = Arc::new(SyncManager::with_config(
         local.clone(),
         PushLink {
-            target: remote_sync,
+            target: remote.clone(),
         },
         SyncConfig {
             // A periodic round this slow would never explain the propagation below.
@@ -1350,21 +1421,31 @@ async fn a_local_write_reaches_the_peer_through_the_push_channel() {
     sync.notify_local_write();
 
     for _ in 0..50 {
-        if remote.read().get("fresh").is_some() {
+        if remote.node().read().get("fresh").is_some() {
             break;
         }
         sleep(Duration::from_millis(10)).await;
     }
     assert!(
-        remote.read().get("fresh").is_some(),
+        remote.node().read().get("fresh").is_some(),
         "the write should arrive via push, not wait for the hourly round"
     );
     assert!(
-        remote.read().get_including_tombstones("fresh").is_some(),
+        remote
+            .node()
+            .read()
+            .get_including_tombstones("fresh")
+            .is_some(),
         "sanity: the entry is really in the peer's map"
     );
     assert_eq!(
-        remote.read().acks_snapshot().get(&1).copied().unwrap_or(0),
+        remote
+            .node()
+            .read()
+            .acks_snapshot()
+            .get(&1)
+            .copied()
+            .unwrap_or(0),
         0,
         "R3: a push moves data but never coverage"
     );
@@ -1501,6 +1582,179 @@ async fn capacity_limits_refuse_new_keys_but_still_allow_updates() {
     let update = node.write().apply_envelope(merge("k1", 3, b"c")).unwrap();
     assert_eq!(update.rejected, 0);
     assert_eq!(node.read().get("k1").unwrap().value, Some(b"c".to_vec()));
+}
+
+/// Only a v1 *full dump* is a complete delta, so only `is_snapshot` may move acks.
+///
+/// v1's incremental path silently skips origins whose logs were truncated below our
+/// ack, so adopting after one would claim coverage of writes we never received — the
+/// hole INV forbids. Both halves of the condition need a fixture that isolates them:
+/// with only the happy case, `&&` and `||` are indistinguishable.
+#[tokio::test]
+async fn a_v1_response_moves_acks_only_when_it_is_a_full_dump() {
+    use crate::sync::SyncResponse;
+    use crate::types::{Entry, Metadata};
+
+    let response = |is_snapshot: bool, entries: Vec<Entry>| SyncResponse {
+        peer_id: 2,
+        entries,
+        progress: [(2, 7)].into_iter().collect(),
+        is_snapshot,
+    };
+    let good = || {
+        vec![Entry::new(
+            "k".to_string(),
+            Some(b"v".to_vec()),
+            Metadata::new(2, 1, 1),
+        )]
+    };
+
+    // Complete, but incremental: the merge succeeds and the data lands, yet coverage
+    // must stay put.
+    let node = Node::new(1, vec![2]);
+    node.write()
+        .apply_v1_response(response(false, good()))
+        .unwrap();
+    assert!(node.read().get("k").is_some(), "the data is still merged");
+    assert_eq!(
+        node.read().acks_snapshot().get(&2).copied().unwrap_or(0),
+        0,
+        "an incremental v1 response must not move acks"
+    );
+
+    // A snapshot whose merge was incomplete: R1 blocks adoption just the same. The
+    // entry is refused by the clock guard, which is enough to fail the batch.
+    let node = Node::new(1, vec![2]);
+    let poisoned = vec![Entry::new(
+        "bad".to_string(),
+        Some(b"v".to_vec()),
+        Metadata::new(2, 1, i64::MAX),
+    )];
+    node.write()
+        .apply_v1_response(response(true, poisoned))
+        .unwrap();
+    assert_eq!(
+        node.read().acks_snapshot().get(&2).copied().unwrap_or(0),
+        0,
+        "a failed merge blocks adoption even from a full dump"
+    );
+
+    // Both conditions met: now coverage advances.
+    let node = Node::new(1, vec![2]);
+    node.write()
+        .apply_v1_response(response(true, good()))
+        .unwrap();
+    assert_eq!(
+        node.read().acks_snapshot().get(&2).copied().unwrap_or(0),
+        7,
+        "a complete full dump is the one case that may move acks"
+    );
+}
+
+/// After a restart the next write must not reuse a sequence number.
+///
+/// `next_seq` is rebuilt from the highest own seq in the recovered state. Getting the
+/// arithmetic wrong hands out a number that is already in use, and a reused `(node,
+/// seq)` silently collides in every peer's coverage map — the entry is filtered out as
+/// "already seen" and the write is lost with no error anywhere.
+#[tokio::test]
+async fn recovery_resumes_after_the_highest_used_seq() {
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let store = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+    for i in 0..5 {
+        store.write().put(format!("k{i}"), b"v".to_vec()).unwrap();
+    }
+    let highest = store
+        .read()
+        .get_all_including_tombstones()
+        .values()
+        .filter(|e| e.meta.node == 1)
+        .map(|e| e.meta.seq)
+        .max()
+        .expect("five writes");
+    assert_eq!(highest, 5);
+    drop(store);
+
+    let recovered = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+    let next = recovered
+        .write()
+        .put("after".to_string(), b"v".to_vec())
+        .unwrap();
+    assert_eq!(
+        next.meta.seq,
+        highest + 1,
+        "the first post-recovery write must take the very next seq, not reuse or skip"
+    );
+}
+
+/// The identity check is symmetric on the v2 wire, or it protects only one side.
+///
+/// The responder stamps its uuid into the same field the initiator does. An initiator
+/// that ignored it would adopt data *and* acks from whatever machine answered on the
+/// peer's URL — which is exactly the node-id-reuse case the uuid exists to catch, just
+/// approached from the other direction.
+#[tokio::test]
+async fn an_impostor_responder_is_rejected_before_its_data_is_applied() {
+    use crate::sync::{ExchangeInterface, SyncEnvelope, SyncMessage, SyncResponse};
+    use crate::types::{Entry, Metadata};
+
+    #[derive(Clone)]
+    struct ImpostorResponder;
+
+    impl ExchangeInterface for ImpostorResponder {
+        fn uuid(&self) -> Vec<u8> {
+            uuid_for(1)
+        }
+
+        fn query_uuid(&self, node_id: NodeId) -> Option<Vec<u8>> {
+            Some(uuid_for(node_id))
+        }
+
+        async fn sync_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            _msg: SyncMessage,
+        ) -> anyhow::Result<SyncResponse> {
+            anyhow::bail!("the v1 leg is not under test here")
+        }
+
+        async fn sync_v2_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            _env: SyncEnvelope,
+        ) -> anyhow::Result<Option<SyncEnvelope>> {
+            // Right node id, wrong machine.
+            let mut response = SyncEnvelope::new(2, b"a-different-machine".to_vec());
+            response.acks.insert(1, 99);
+            response.entries.push(Entry::new(
+                "planted".to_string(),
+                Some(b"v".to_vec()),
+                Metadata::new(2, 1, 1),
+            ));
+            Ok(Some(response))
+        }
+    }
+
+    let local = Node::new(1, vec![2]);
+    let sync = SyncManager::new(local.clone(), ImpostorResponder);
+
+    // Per-peer failures are logged rather than propagated, so the round "succeeds"...
+    sync.bootstrap().await.unwrap();
+
+    // ...but nothing the impostor sent may have been believed.
+    assert!(
+        local.read().get("planted").is_none(),
+        "an unverified responder must not be able to plant data"
+    );
+    assert_eq!(
+        local.read().acks_snapshot().get(&1).copied().unwrap_or(0),
+        0,
+        "nor to move our coverage"
+    );
 }
 
 /// Node ids are the addressing scheme, so reusing one across two machines silently

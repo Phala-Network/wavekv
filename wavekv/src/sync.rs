@@ -556,6 +556,12 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
         let Some(response) = result? else {
             return Ok(false);
         };
+        // The check is symmetric on the v2 wire: the responder stamps its identity in
+        // the same field, so an initiator that skipped this would take data and acks
+        // from any machine that answered on the peer's URL — including one that had
+        // reused the node id, which is the exact failure the uuid exists to catch. (The
+        // v1 `SyncResponse` carries no uuid, so that direction cannot be checked.)
+        self.check_uuid(response.sender_id, &response.sender_uuid)?;
 
         self.update_link(peer, |link| {
             link.protocol = PeerProtocol::V2;
@@ -609,6 +615,7 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
             else {
                 break;
             };
+            self.check_uuid(response.sender_id, &response.sender_uuid)?;
             resume = self.store.write().apply_envelope(response)?.resume_from;
         }
 
