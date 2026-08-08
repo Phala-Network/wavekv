@@ -441,6 +441,10 @@ impl NodeState {
     /// Drain the pending local writes into an opportunistic push envelope
     /// (rule R3: entries only, no ack authority). Returns `None` when nothing is
     /// pending, so the push loop can idle without allocating.
+    ///
+    /// The envelope is returned with an empty `sender_uuid`: this type has no access to
+    /// the [`ExchangeInterface`](crate::sync::ExchangeInterface). The caller must stamp
+    /// it before sending, or the receiver's `check_uuid` will reject the push.
     pub fn take_push_envelope(&mut self) -> Option<SyncEnvelope> {
         let keys = std::mem::take(&mut self.pending_push);
         if keys.is_empty() {

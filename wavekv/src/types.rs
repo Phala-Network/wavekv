@@ -103,12 +103,14 @@ impl Entry {
     pub fn is_deleted(&self) -> bool {
         self.value.is_none()
     }
-
-    /// Check if this is an expired tombstone
-    pub fn is_expired_tombstone(&self, ttl_ms: i64, current_time_ms: i64) -> bool {
-        self.value.is_none() && (current_time_ms >= self.meta.timestamp.saturating_add(ttl_ms))
-    }
 }
+
+// `is_expired_tombstone(ttl_ms, now_ms)` was removed in 2.0 along with v1's local-clock
+// tombstone TTL. Collecting a tombstone on a local timer is precisely what lets a lagging
+// replica resurrect a deleted key (RFC 0001 Section 6) — in gateway terms, a deregistered
+// CVM reappearing in every peer's WireGuard config. Tombstone lifetime is now decided by
+// `NodeState::collect_tombstone_garbage`, which requires every known peer to have
+// acknowledged the delete first.
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Metadata {

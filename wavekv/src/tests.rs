@@ -1,8 +1,15 @@
 use crate::node::Node;
 use crate::sync::SyncManager;
-use crate::types::{compare_entries, Entry, Metadata};
+use crate::types::{compare_entries, Entry, Metadata, NodeId};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
+
+/// A stable per-node identity, so a transport can implement `query_uuid` the way a real
+/// embedder does. Tests that leave `query_uuid` at its default `None` disable the check
+/// entirely and cannot observe an unstamped envelope.
+fn uuid_for(node: NodeId) -> Vec<u8> {
+    format!("uuid-of-node-{node}").into_bytes()
+}
 
 #[tokio::test]
 async fn test_dynamic_membership() {
@@ -277,12 +284,28 @@ async fn test_concurrent_writes_resolution() {
 }
 
 #[tokio::test]
-async fn test_lww_equal_timestamp_tombstone_wins_compare() {
-    // Two entries with the same timestamp; tombstone should win
+async fn equal_timestamps_are_broken_by_node_id_not_by_tombstone() {
+    // The LWW order is `(timestamp, node, seq)` (RFC 3.5) and is frozen for the
+    // mixed-version window: v1 resolves the same way, so changing it would split a
+    // mixed cluster. Deletes get no special treatment — asserting that in both
+    // directions is what stops "the tombstone wins" from being read into the rule.
     let put = Entry::new_put(Metadata::new(1, 1, 1234), "k".into(), b"v".to_vec());
     let del = Entry::new_delete(Metadata::new(2, 2, 1234), "k".into());
     assert_eq!(compare_entries(&put, &del), std::cmp::Ordering::Less);
     assert_eq!(compare_entries(&del, &put), std::cmp::Ordering::Greater);
+
+    // Same shape, tombstone on the *lower* node id: now the put wins. A fixture that
+    // only covers the case above cannot tell the two rules apart.
+    let del_low = Entry::new_delete(Metadata::new(1, 1, 1234), "k".into());
+    let put_high = Entry::new_put(Metadata::new(2, 2, 1234), "k".into(), b"v".to_vec());
+    assert_eq!(
+        compare_entries(&del_low, &put_high),
+        std::cmp::Ordering::Less
+    );
+    assert_eq!(
+        compare_entries(&put_high, &del_low),
+        std::cmp::Ordering::Greater
+    );
 }
 
 #[tokio::test]
@@ -295,43 +318,90 @@ async fn test_lww_equal_timestamp_node_id_tie_non_tombstone() {
 }
 
 #[tokio::test]
-async fn test_sync_equal_timestamp_tombstone_wins() {
+async fn sync_breaks_an_equal_timestamp_tie_by_node_id() {
     let store = Node::new(1, vec![]);
 
-    // Start with a put
+    // A tombstone on the higher node id displaces the put.
     let put = Entry::new_put(Metadata::new(1, 1, 1000), "k".into(), b"v".to_vec());
     store.write().sync(put).unwrap();
-
-    // Sync a tombstone with the same timestamp but higher node_id
     let del = Entry::new_delete(Metadata::new(2, 2, 1000), "k".into());
-    let updated = store.write().sync(del).unwrap();
-    assert!(updated);
-
-    // The tombstone should win
+    assert!(store.write().sync(del).unwrap());
     assert!(store.read().get("k").is_none());
+
+    // ...and the reverse: a tombstone on the lower node id is itself displaced. The
+    // merge path must agree with `compare_entries`, including where that is not the
+    // delete-friendly answer.
+    let other = Node::new(1, vec![]);
+    let del_low = Entry::new_delete(Metadata::new(1, 1, 1000), "j".into());
+    other.write().sync(del_low).unwrap();
+    let put_high = Entry::new_put(Metadata::new(2, 2, 1000), "j".into(), b"v".to_vec());
+    assert!(other.write().sync(put_high).unwrap());
+    assert_eq!(
+        other.read().get("j").and_then(|e| e.value),
+        Some(b"v".to_vec()),
+        "the higher node id wins even when the loser is a tombstone"
+    );
 }
 
 #[tokio::test]
-async fn test_wal_recovery_equal_timestamp_tombstone_wins() {
+async fn wal_replay_preserves_the_equal_timestamp_tiebreak() {
     use tempfile::TempDir;
 
     let temp_dir = TempDir::new().unwrap();
     let wal_path = temp_dir.path();
 
-    // Create store with WAL
     let store = Node::new_with_persistence(1, vec![], wal_path).unwrap();
 
-    // Write some data
+    // `k`: the tombstone holds the higher node id and wins.
     store
         .write()
-        .put("key1".to_string(), "value1".to_string())
+        .sync(Entry::new_put(
+            Metadata::new(1, 1, 1000),
+            "k".into(),
+            b"v".to_vec(),
+        ))
         .unwrap();
+    store
+        .write()
+        .sync(Entry::new_delete(Metadata::new(2, 2, 1000), "k".into()))
+        .unwrap();
+
+    // `j`: the tombstone holds the lower node id and loses. Both directions matter,
+    // because replay re-applies the ops in log order — a resolver that silently
+    // depended on arrival order would diverge here and nowhere else.
+    store
+        .write()
+        .sync(Entry::new_delete(Metadata::new(1, 1, 1000), "j".into()))
+        .unwrap();
+    store
+        .write()
+        .sync(Entry::new_put(
+            Metadata::new(2, 2, 1000),
+            "j".into(),
+            b"v".to_vec(),
+        ))
+        .unwrap();
+
+    assert!(store.read().get("k").is_none());
+    assert!(store.read().get("j").is_some());
     drop(store);
 
-    // Recover from WAL
     let recovered = Node::new_with_persistence(1, vec![], wal_path).unwrap();
-    let item = recovered.read().get("key1").unwrap();
-    assert_eq!(item.value, Some(b"value1".to_vec()));
+    assert!(
+        recovered.read().get("k").is_none(),
+        "the winning tombstone must still win after WAL replay"
+    );
+    let tombstone = recovered
+        .read()
+        .get_including_tombstones("k")
+        .expect("the tombstone itself must survive replay, not merely the missing value");
+    assert!(tombstone.value.is_none());
+    assert_eq!((tombstone.meta.node, tombstone.meta.timestamp), (2, 1000));
+    assert_eq!(
+        recovered.read().get("j").and_then(|e| e.value),
+        Some(b"v".to_vec()),
+        "and the losing tombstone must still lose"
+    );
 }
 
 /// Tombstone GC is gated on replication, not on a local clock.
@@ -678,12 +748,15 @@ async fn a_sync_manager_round_converges_two_nodes() {
     assert_eq!(store1.state_digest(), store2.state_digest());
     assert!(store1.read().get("other").is_some());
     assert!(store2.read().get("key").is_some());
+    let status = sync
+        .link_status()
+        .into_iter()
+        .find(|s| s.id == 2)
+        .expect("peer 2 is known and must be reported");
+    assert_eq!(status.protocol, "v2");
     assert_eq!(
-        sync.link_status()
-            .iter()
-            .find(|s| s.id == 2)
-            .map(|s| s.protocol),
-        Some("v2")
+        status.consecutive_failures, 0,
+        "a healthy round must clear the streak, not merely stop incrementing it"
     );
 }
 
@@ -891,6 +964,91 @@ async fn a_peer_without_the_v2_route_falls_back_to_v1() {
     assert_eq!(v1_rounds.load(Ordering::SeqCst), 2);
 }
 
+/// A *failing* v2 route is not a v1 route.
+///
+/// Only 404/405 — surfaced as `Ok(None)` — means "not upgraded yet". A 5xx or a timeout
+/// is a transport failure: the round fails and is retried, and the cached protocol must
+/// not move. Demoting on any error instead would silently pin a healthy v2 peer to the
+/// v1 path for a whole reprobe window every time it hiccuped.
+#[tokio::test]
+async fn a_failing_v2_route_is_retried_rather_than_mistaken_for_v1() {
+    use crate::sync::{ExchangeInterface, SyncConfig, SyncEnvelope, SyncMessage, SyncResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct V2Broken {
+        v2_attempts: Arc<AtomicUsize>,
+        v1_rounds: Arc<AtomicUsize>,
+    }
+
+    impl ExchangeInterface for V2Broken {
+        async fn sync_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            _msg: SyncMessage,
+        ) -> anyhow::Result<SyncResponse> {
+            self.v1_rounds.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("the v1 leg must not be reached for a 5xx on the v2 route")
+        }
+
+        async fn sync_v2_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            _env: SyncEnvelope,
+        ) -> anyhow::Result<Option<SyncEnvelope>> {
+            self.v2_attempts.fetch_add(1, Ordering::SeqCst);
+            // HTTP 500, a gzip failure, a refused connection: anything that is not
+            // "no such route".
+            anyhow::bail!("request failed: 500 Internal Server Error")
+        }
+    }
+
+    let v2_attempts = Arc::new(AtomicUsize::new(0));
+    let v1_rounds = Arc::new(AtomicUsize::new(0));
+    let sync = SyncManager::with_config(
+        Node::new(1, vec![2]),
+        V2Broken {
+            v2_attempts: v2_attempts.clone(),
+            v1_rounds: v1_rounds.clone(),
+        },
+        SyncConfig {
+            protocol_reprobe: Duration::from_secs(3600),
+            ..Default::default()
+        },
+    );
+
+    // Per-peer failures are logged, not propagated (same contract as a timeout).
+    sync.bootstrap().await.unwrap();
+    sync.bootstrap().await.unwrap();
+
+    assert_eq!(
+        v2_attempts.load(Ordering::SeqCst),
+        2,
+        "every round must retry v2; the reprobe window governs demoted peers only"
+    );
+    assert_eq!(
+        v1_rounds.load(Ordering::SeqCst),
+        0,
+        "a 5xx must not fall back to v1"
+    );
+    let status = sync
+        .link_status()
+        .into_iter()
+        .find(|s| s.id == 2)
+        .expect("a peer that only ever failed must still be reported, not omitted");
+    assert_eq!(
+        status.protocol, "v2",
+        "the cached protocol must survive a transport failure"
+    );
+    assert_eq!(
+        status.consecutive_failures, 2,
+        "the failure streak is the only signal that distinguishes this from a healthy peer"
+    );
+}
+
 /// ...but the verdict must expire, or a peer upgraded mid-rollout would stay on the v1
 /// path until the whole cluster restarted.
 #[tokio::test]
@@ -1095,9 +1253,44 @@ async fn a_local_write_reaches_the_peer_through_the_push_channel() {
     use crate::sync::{ExchangeInterface, SyncConfig, SyncEnvelope, SyncMessage, SyncResponse};
     use std::sync::Arc;
 
+    // The receiver is driven through `SyncManager::handle_push`, not `merge_push`:
+    // `check_uuid` lives on the manager, so a fake that merges straight into the
+    // `NodeState` would skip the only step that can reject a push. Both sides also
+    // implement `query_uuid`, because the check is opt-in and a transport that leaves
+    // it at the default `None` cannot fail it either.
+    #[derive(Clone)]
+    struct DeadLink {
+        me: NodeId,
+    }
+
+    impl ExchangeInterface for DeadLink {
+        fn uuid(&self) -> Vec<u8> {
+            uuid_for(self.me)
+        }
+        fn query_uuid(&self, node_id: NodeId) -> Option<Vec<u8>> {
+            Some(uuid_for(node_id))
+        }
+        async fn sync_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            _msg: SyncMessage,
+        ) -> anyhow::Result<SyncResponse> {
+            anyhow::bail!("the periodic round is disabled for this test")
+        }
+        async fn sync_v2_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            _env: SyncEnvelope,
+        ) -> anyhow::Result<Option<SyncEnvelope>> {
+            anyhow::bail!("the periodic round is disabled for this test")
+        }
+    }
+
     #[derive(Clone)]
     struct PushLink {
-        target: Node,
+        target: Arc<SyncManager<DeadLink>>,
     }
 
     // Both sync legs are dead, so anything that reaches the peer can only have
@@ -1105,6 +1298,12 @@ async fn a_local_write_reaches_the_peer_through_the_push_channel() {
     // immediately, so leaving the periodic round working would deliver the write at
     // startup and prove nothing.)
     impl ExchangeInterface for PushLink {
+        fn uuid(&self) -> Vec<u8> {
+            uuid_for(1)
+        }
+        fn query_uuid(&self, node_id: NodeId) -> Option<Vec<u8>> {
+            Some(uuid_for(node_id))
+        }
         async fn sync_to(
             &self,
             _node: &Node,
@@ -1122,17 +1321,18 @@ async fn a_local_write_reaches_the_peer_through_the_push_channel() {
             anyhow::bail!("the periodic round is disabled for this test")
         }
         async fn push_to(&self, _node: &Node, _peer: u32, env: SyncEnvelope) -> anyhow::Result<()> {
-            self.target.write().merge_push(env)
+            self.target.handle_push(env)
         }
     }
 
     let local = Node::new(1, vec![2]);
     let remote = Node::new(2, vec![1]);
+    let remote_sync = Arc::new(SyncManager::new(remote.clone(), DeadLink { me: 2 }));
 
     let sync = Arc::new(SyncManager::with_config(
         local.clone(),
         PushLink {
-            target: remote.clone(),
+            target: remote_sync,
         },
         SyncConfig {
             // A periodic round this slow would never explain the propagation below.
@@ -1173,6 +1373,94 @@ async fn a_local_write_reaches_the_peer_through_the_push_channel() {
 // ---------------------------------------------------------------------------
 // Remaining ingest guards
 // ---------------------------------------------------------------------------
+
+/// A runaway-clock peer does not merely lose one round — it stalls the pair.
+///
+/// Rejecting an entry sets `complete = false` for the whole batch (R1), so no acks move,
+/// so our coverage for that origin never advances, so the same entry is re-offered next
+/// round. The stall therefore persists for as long as the timestamp stays out of bounds,
+/// and it takes down origins that had nothing to do with the offending entry. Pinning
+/// both the persistence and the self-heal is what keeps this a bounded, understood cost
+/// rather than a mystery outage.
+#[tokio::test]
+async fn a_future_stamped_entry_stalls_every_round_until_it_falls_in_range() {
+    use crate::sync::SyncEnvelope;
+    use crate::types::{Entry, Metadata};
+    use crate::{Limits, NodeConfig};
+
+    let node = Node::with_config(
+        1,
+        vec![2],
+        NodeConfig {
+            limits: Limits {
+                max_clock_drift: Duration::from_secs(60),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_millis() as i64
+    };
+
+    // One poisoned entry from origin 2, one innocent entry from origin 3, one ack map
+    // covering both. The innocent origin is the point: R1 is batch-wide.
+    let envelope = |poison_ts: i64| {
+        let mut env = SyncEnvelope::new(2, vec![]);
+        env.entries.push(Entry::new(
+            "poisoned".to_string(),
+            Some(b"v".to_vec()),
+            Metadata::new(2, 1, poison_ts),
+        ));
+        env.entries.push(Entry::new(
+            "innocent".to_string(),
+            Some(b"v".to_vec()),
+            Metadata::new(3, 1, now()),
+        ));
+        env.acks.insert(2, 1);
+        env.acks.insert(3, 1);
+        env
+    };
+
+    for round in 1..=3 {
+        let outcome = node
+            .write()
+            .apply_envelope(envelope(now() + 3_600_000))
+            .unwrap();
+        assert_eq!(outcome.rejected, 1, "round {round}");
+        assert!(
+            !outcome.acks_adopted,
+            "round {round}: one out-of-range entry parks the whole batch"
+        );
+        assert!(
+            node.read().get("poisoned").is_none(),
+            "round {round}: the poisoned value must never land"
+        );
+        assert_eq!(
+            node.read().acks_snapshot().get(&3).copied().unwrap_or(0),
+            0,
+            "round {round}: an unrelated origin is stalled too — this is the real cost"
+        );
+    }
+
+    // Wall time catches up (modelled by a timestamp that is now in range). Nothing had
+    // to be reset by hand: the peer re-offers the same entry and the round completes.
+    let outcome = node
+        .write()
+        .apply_envelope(envelope(now() + 1_000))
+        .unwrap();
+    assert_eq!(outcome.rejected, 0);
+    assert!(
+        outcome.acks_adopted,
+        "the pair must heal without intervention"
+    );
+    assert!(node.read().get("poisoned").is_some());
+    assert_eq!(node.read().acks_snapshot().get(&3).copied().unwrap_or(0), 1);
+}
 
 #[tokio::test]
 async fn capacity_limits_refuse_new_keys_but_still_allow_updates() {
@@ -1217,9 +1505,10 @@ async fn capacity_limits_refuse_new_keys_but_still_allow_updates() {
 
 /// Node ids are the addressing scheme, so reusing one across two machines silently
 /// merges their sequence spaces. The UUID check is what catches that, and it must work
-/// on both the v1 and v2 entry points.
+/// on *every* inbound entry point — v1, v2 and push. Covering only two of the three is
+/// how a sender that never stamped its push envelopes went unnoticed.
 #[tokio::test]
-async fn a_reused_node_id_is_rejected_on_both_protocols() {
+async fn a_reused_node_id_is_rejected_on_every_entry_point() {
     use crate::sync::{ExchangeInterface, SyncEnvelope, SyncMessage, SyncResponse};
 
     #[derive(Clone)]
@@ -1258,7 +1547,27 @@ async fn a_reused_node_id_is_rejected_on_both_protocols() {
     let err = sync.handle_sync(v1_impostor).unwrap_err();
     assert!(err.to_string().contains("UUID mismatch"), "{err}");
 
-    // The genuine peer is still served.
+    // The push channel is the third entry point and is checked exactly like the other
+    // two. An envelope that reaches it *unstamped* is what a sender that forgot to fill
+    // `sender_uuid` produces, so this also pins the failure mode down.
+    let mut push_impostor = SyncEnvelope::new(2, b"someone-else".to_vec());
+    push_impostor.push_only = true;
+    let err = sync.handle_push(push_impostor).unwrap_err();
+    assert!(err.to_string().contains("UUID mismatch"), "{err}");
+
+    let mut unstamped = SyncEnvelope::new(2, Vec::new());
+    unstamped.push_only = true;
+    let err = sync.handle_push(unstamped).unwrap_err();
+    assert!(
+        err.to_string().contains("UUID mismatch"),
+        "an unstamped push must be rejected, not silently merged: {err}"
+    );
+
+    // The genuine peer is still served on every entry point.
     let genuine = SyncEnvelope::new(2, b"the-real-node-2".to_vec());
     assert!(sync.handle_envelope(genuine).is_ok());
+
+    let mut genuine_push = SyncEnvelope::new(2, b"the-real-node-2".to_vec());
+    genuine_push.push_only = true;
+    assert!(sync.handle_push(genuine_push).is_ok());
 }

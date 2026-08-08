@@ -16,9 +16,15 @@ use tracing::{debug, error, info, warn};
 // ---------------------------------------------------------------------------
 // v1 wire format — frozen for the duration of the mixed-version window.
 //
-// These structs are `rmp_serde` positional encodings shared with wavekv 1.x. Adding,
-// removing or reordering a field breaks every v1 peer, so they must not change until
-// the RFC 0001 Phase 2 gate ("all nodes on v2 for N days") is met.
+// These structs are shared with wavekv 1.x. Adding, removing or reordering a field
+// breaks every v1 peer, so they must not change until the RFC 0001 Phase 2 gate ("all
+// nodes on v2 for N days") is met.
+//
+// The library does not encode them: the transport is the embedder's, and so is the
+// choice of codec. Field *order* only matters under a positional encoder (`rmp_serde`'s
+// default `to_vec`); an embedder on a named encoder (`to_vec_named`, JSON) is bound by
+// field *names* instead. Either way the freeze applies — just to a different property
+// than the type declaration suggests.
 // ---------------------------------------------------------------------------
 
 /// Bidirectional sync: sender includes their local_ack AND their new entries
@@ -225,6 +231,10 @@ struct PeerLink {
     protocol: PeerProtocol,
     probed_at: Option<Instant>,
     digest_mismatches: u32,
+    /// Rounds that have failed back to back. A transport failure deliberately does not
+    /// change `protocol` (only a definitive 404/405 does), so without this counter a
+    /// peer that fails every single round is indistinguishable from a healthy one.
+    consecutive_failures: u32,
 }
 
 impl Default for PeerLink {
@@ -234,6 +244,7 @@ impl Default for PeerLink {
             protocol: PeerProtocol::V2,
             probed_at: None,
             digest_mismatches: 0,
+            consecutive_failures: 0,
         }
     }
 }
@@ -244,6 +255,9 @@ pub struct PeerLinkStatus {
     pub id: NodeId,
     pub protocol: &'static str,
     pub digest_mismatches: u32,
+    /// Rounds failed back to back; `0` once a round succeeds. A peer stuck on a 5xx
+    /// keeps `protocol` unchanged by design, so this is the only field that moves.
+    pub consecutive_failures: u32,
 }
 
 /// Dual-stack sync manager: speaks v2 natively and v1 for peers that have not been
@@ -284,18 +298,30 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
     }
 
     /// Per-peer protocol and digest telemetry.
+    /// Telemetry for **every** known peer, not just the ones the cache happens to hold.
+    ///
+    /// The cache is written on demotion and on a completed round, so reporting it
+    /// directly would omit exactly the peers an operator most needs to see: one that has
+    /// never been reached at all, and one whose every round fails without a demotion.
+    /// Peers absent from the cache report the optimistic default they are actually
+    /// being treated as.
     pub fn link_status(&self) -> Vec<PeerLinkStatus> {
+        let peers = self.store.read().get_peers();
         #[allow(clippy::expect_used)]
         let links = self.links.lock().expect("lock should never fail");
-        let mut out: Vec<_> = links
-            .iter()
-            .map(|(&id, link)| PeerLinkStatus {
-                id,
-                protocol: match link.protocol {
-                    PeerProtocol::V1 => "v1",
-                    PeerProtocol::V2 => "v2",
-                },
-                digest_mismatches: link.digest_mismatches,
+        let mut out: Vec<_> = peers
+            .into_iter()
+            .map(|id| {
+                let link = links.get(&id).copied().unwrap_or_default();
+                PeerLinkStatus {
+                    id,
+                    protocol: match link.protocol {
+                        PeerProtocol::V1 => "v1",
+                        PeerProtocol::V2 => "v2",
+                    },
+                    digest_mismatches: link.digest_mismatches,
+                    consecutive_failures: link.consecutive_failures,
+                }
             })
             .collect();
         out.sort_by_key(|s| s.id);
@@ -385,9 +411,13 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
                 _ = self.push_signal.notified() => {}
             }
 
-            let Some(env) = self.store.write().take_push_envelope() else {
+            let Some(mut env) = self.store.write().take_push_envelope() else {
                 continue;
             };
+            // `NodeState` has no access to the network, so the identity is stamped here,
+            // exactly as `sync_v1` and `sync_v2` do. Omitting it makes every push fail
+            // `check_uuid` on any embedder that implements `query_uuid`.
+            env.sender_uuid = self.app.uuid();
 
             let peers = self.store.read().get_peers();
             let futures: Vec<_> = peers
@@ -471,7 +501,17 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
 
         let sync_futures: Vec<_> = peers
             .iter()
-            .map(|&peer| async move { (peer, self.sync_to(peer).await) })
+            .map(|&peer| async move {
+                let result = self.sync_to(peer).await;
+                self.update_link(peer, |link| {
+                    link.consecutive_failures = if result.is_ok() {
+                        0
+                    } else {
+                        link.consecutive_failures.saturating_add(1)
+                    };
+                });
+                (peer, result)
+            })
             .collect();
 
         join_all(sync_futures).await
