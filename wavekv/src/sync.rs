@@ -375,28 +375,33 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
         let Some(window) = self.config.coalesce_window else {
             return;
         };
+        let mut ticker = interval(window);
         loop {
-            self.push_signal.notified().await;
-            // Coalesce a burst of writes into a single push.
-            tokio::time::sleep(window).await;
+            // Either a local write signalled us or the window elapsed. Ticking as well
+            // as waiting on the signal means a missed notification costs latency, not
+            // correctness — and the loop still drains if the embedder never signals.
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = self.push_signal.notified() => {}
+            }
+
+            let Some(env) = self.store.write().take_push_envelope() else {
+                continue;
+            };
 
             let peers = self.store.read().get_peers();
             let futures: Vec<_> = peers
                 .iter()
-                .map(|&peer| async move {
-                    if !self.should_try_v2(peer) {
-                        // v1 peers have no opportunistic channel; they will pull.
-                        return;
-                    }
-                    let env = {
-                        let state = self.store.read();
-                        state.prepare_push(peer)
-                    };
-                    if env.entries.is_empty() {
-                        return;
-                    }
-                    if let Err(err) = self.app.push_to(&self.store, peer, env).await {
-                        debug!("opportunistic push to {peer} failed (harmless): {err}");
+                .map(|&peer| {
+                    let env = env.clone();
+                    async move {
+                        if !self.should_try_v2(peer) {
+                            // v1 peers have no opportunistic channel; they will pull.
+                            return;
+                        }
+                        if let Err(err) = self.app.push_to(&self.store, peer, env).await {
+                            debug!("opportunistic push to {peer} failed (harmless): {err}");
+                        }
                     }
                 })
                 .collect();

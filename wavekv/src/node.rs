@@ -438,20 +438,21 @@ impl NodeState {
         env
     }
 
-    /// Build an opportunistic push envelope (rule R3: entries only).
-    pub fn prepare_push(&self, _peer: NodeId) -> SyncEnvelope {
+    /// Drain the pending local writes into an opportunistic push envelope
+    /// (rule R3: entries only, no ack authority). Returns `None` when nothing is
+    /// pending, so the push loop can idle without allocating.
+    pub fn take_push_envelope(&mut self) -> Option<SyncEnvelope> {
+        let keys = std::mem::take(&mut self.pending_push);
+        if keys.is_empty() {
+            return None;
+        }
         let mut env = SyncEnvelope::new(self.id, Vec::new());
         env.push_only = true;
-        env.entries = self
-            .pending_push
+        env.entries = keys
             .iter()
             .filter_map(|key| self.core.data().get(key).cloned())
             .collect();
-        env
-    }
-
-    pub fn take_pending_push(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.pending_push)
+        (!env.entries.is_empty()).then_some(env)
     }
 
     /// Merge an opportunistically pushed envelope. Data only — never acks (R3).
@@ -643,6 +644,12 @@ impl NodeState {
         // Our own writes are allocated in order, so we cover them contiguously.
         self.core.bump_ack(self.id, entry.meta.seq);
         if self.config.coalesce_window.is_some() {
+            // Bounded: if the push loop is not draining (or is not running at all),
+            // drop the backlog rather than growing without limit. The periodic round
+            // is the backstop, so the only cost is latency.
+            if self.pending_push.len() >= self.config.max_delta_entries {
+                self.pending_push.clear();
+            }
             self.pending_push.push(entry.key.clone());
         }
     }
