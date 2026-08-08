@@ -132,6 +132,7 @@ struct CoreState {
     data: BTreeMap<String, Entry>,
 
     /// NEW: secondary index for delta queries.
+    /// Assumes (meta.node, meta.seq) is unique per origin across all writes; if conflicting pairs are observed on ingest, treat it as a protocol violation and reject.
     /// Maintained on every Set/Clear; rebuilt from `data` on startup (not persisted).
     origin_index: BTreeMap<(NodeId, u64 /* seq */), String /* key */>,
 
@@ -378,8 +379,7 @@ backstop and the only ack authority.
 
 ### 3.10 Durability changes
 
-- **WAL records only `Set` and `Clear`.** Acks are volatile (recovered by
-  re-syncing; worst case is one larger delta). This removes the v1 pattern of
+- **WAL records only `Set` and `Clear`.** Acks are not WAL-durable; losing them is safe (they can be recovered by re-syncing; worst case is one larger delta). This removes the v1 pattern of
   two WAL records per synced entry plus fsync traffic on idle sync rounds, and
   shrinks the `StateOp` enum to the two ops that define the database.
 - **Snapshots** persist `data` + `acks` + `next_seq` (`origin_index` is
@@ -481,9 +481,9 @@ in hours to days.
 
 ### 8.1 Wire-format freeze
 
-Coexistence constrains what v2 may change, because all payloads are
-`rmp_serde` **positional** encodings — adding a field to a struct breaks v1
-decoders. Frozen for the entire transition:
+Coexistence constrains what v2 may change, because in dstack-gateway the sync
+payloads are encoded with `rmp_serde` using **positional** (array) struct encoding
+— under that encoding, adding a field to a struct breaks v1 decoders. Frozen for the entire transition:
 
 - `Entry` and `Metadata` layouts (hence: HLC unification is deferred, 3.5).
 - v1 `SyncMessage`/`SyncResponse` layouts (the shim speaks them verbatim).
