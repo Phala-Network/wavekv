@@ -745,3 +745,520 @@ async fn a_slow_peer_times_out_without_panicking() {
     // Bootstrap logs per-peer failures and continues rather than propagating them.
     assert!(sync.bootstrap().await.is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot recovery
+// ---------------------------------------------------------------------------
+
+/// Local persistence damage must be a quarantine-and-resync event, never a refusal to
+/// start: the state is fully replicated, so a node that will not boot is strictly worse
+/// than one that boots slightly stale.
+#[tokio::test]
+async fn a_corrupt_snapshot_falls_back_to_the_previous_generation() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let node = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+        node.write()
+            .put("gen".to_string(), b"one".to_vec())
+            .unwrap();
+        node.persist().unwrap();
+        node.write()
+            .put("gen".to_string(), b"two".to_vec())
+            .unwrap();
+        node.persist().unwrap(); // rotates generation one into .snapshot.bak
+    }
+
+    let snapshot = dir.path().join("node_1.snapshot");
+    let backup = dir.path().join("node_1.snapshot.bak");
+    assert!(backup.exists(), "a previous generation must be retained");
+    fs_err::write(&snapshot, b"shredded").unwrap();
+
+    let node = Node::new_with_persistence(1, vec![2], dir.path())
+        .expect("a damaged snapshot must not prevent startup");
+    assert_eq!(
+        node.read().get("gen").map(|e| e.value.unwrap()),
+        Some(b"one".to_vec()),
+        "the node should come up on the retained generation and re-sync the rest"
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_snapshot_and_backup_still_start_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let node = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+        node.write().put("k".to_string(), b"v".to_vec()).unwrap();
+        node.persist().unwrap();
+        node.write().put("k2".to_string(), b"v".to_vec()).unwrap();
+        node.persist().unwrap();
+    }
+    fs_err::write(dir.path().join("node_1.snapshot"), b"x").unwrap();
+    fs_err::write(dir.path().join("node_1.snapshot.bak"), b"x").unwrap();
+
+    let node = Node::new_with_persistence(1, vec![2], dir.path())
+        .expect("both generations unusable must still start");
+    assert_eq!(node.read().get_all_including_tombstones().len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Protocol negotiation
+// ---------------------------------------------------------------------------
+
+/// A peer that has not been upgraded answers the v2 route with "no such route", which
+/// the transport reports as `Ok(None)`. The manager must fall back rather than treating
+/// it as a failed round, and must remember the verdict.
+#[tokio::test]
+async fn a_peer_without_the_v2_route_falls_back_to_v1() {
+    use crate::sync::{ExchangeInterface, SyncConfig, SyncEnvelope, SyncMessage, SyncResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct V1Only {
+        target: Node,
+        v2_probes: Arc<AtomicUsize>,
+        v1_rounds: Arc<AtomicUsize>,
+    }
+
+    impl ExchangeInterface for V1Only {
+        async fn sync_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            msg: SyncMessage,
+        ) -> anyhow::Result<SyncResponse> {
+            self.v1_rounds.fetch_add(1, Ordering::SeqCst);
+            self.target.write().handle_sync_v1(msg)
+        }
+
+        async fn sync_v2_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            _env: SyncEnvelope,
+        ) -> anyhow::Result<Option<SyncEnvelope>> {
+            self.v2_probes.fetch_add(1, Ordering::SeqCst);
+            Ok(None) // 404: this peer speaks only v1
+        }
+    }
+
+    let local = Node::new(1, vec![2]);
+    let remote = Node::new(2, vec![1]);
+    remote
+        .write()
+        .put("remote".to_string(), b"v".to_vec())
+        .unwrap();
+
+    let v2_probes = Arc::new(AtomicUsize::new(0));
+    let v1_rounds = Arc::new(AtomicUsize::new(0));
+    let sync = SyncManager::with_config(
+        local.clone(),
+        V1Only {
+            target: remote.clone(),
+            v2_probes: v2_probes.clone(),
+            v1_rounds: v1_rounds.clone(),
+        },
+        SyncConfig {
+            // Long enough that the second round must reuse the cached verdict.
+            protocol_reprobe: Duration::from_secs(3600),
+            ..Default::default()
+        },
+    );
+
+    sync.bootstrap().await.unwrap();
+    assert_eq!(v2_probes.load(Ordering::SeqCst), 1);
+    assert_eq!(v1_rounds.load(Ordering::SeqCst), 1, "must have fallen back");
+    assert!(
+        local.read().get("remote").is_some(),
+        "data still flows over v1"
+    );
+    assert_eq!(
+        sync.link_status()
+            .iter()
+            .find(|s| s.id == 2)
+            .map(|s| s.protocol),
+        Some("v1")
+    );
+
+    // The cached verdict spares the peer a probe on every subsequent round.
+    sync.bootstrap().await.unwrap();
+    assert_eq!(
+        v2_probes.load(Ordering::SeqCst),
+        1,
+        "a peer known to be v1 must not be re-probed until the reprobe window elapses"
+    );
+    assert_eq!(v1_rounds.load(Ordering::SeqCst), 2);
+}
+
+/// ...but the verdict must expire, or a peer upgraded mid-rollout would stay on the v1
+/// path until the whole cluster restarted.
+#[tokio::test]
+async fn an_upgraded_peer_is_picked_up_after_the_reprobe_window() {
+    use crate::sync::{ExchangeInterface, SyncConfig, SyncEnvelope, SyncMessage, SyncResponse};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct Upgradable {
+        target: Node,
+        speaks_v2: Arc<AtomicBool>,
+    }
+
+    impl ExchangeInterface for Upgradable {
+        async fn sync_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            msg: SyncMessage,
+        ) -> anyhow::Result<SyncResponse> {
+            self.target.write().handle_sync_v1(msg)
+        }
+
+        async fn sync_v2_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            env: SyncEnvelope,
+        ) -> anyhow::Result<Option<SyncEnvelope>> {
+            if !self.speaks_v2.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            Ok(Some(self.target.write().handle_envelope(env, vec![])?))
+        }
+    }
+
+    let local = Node::new(1, vec![2]);
+    let remote = Node::new(2, vec![1]);
+    let speaks_v2 = Arc::new(AtomicBool::new(false));
+
+    let sync = SyncManager::with_config(
+        local.clone(),
+        Upgradable {
+            target: remote.clone(),
+            speaks_v2: speaks_v2.clone(),
+        },
+        SyncConfig {
+            protocol_reprobe: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+
+    sync.bootstrap().await.unwrap();
+    assert_eq!(
+        sync.link_status()
+            .iter()
+            .find(|s| s.id == 2)
+            .map(|s| s.protocol),
+        Some("v1")
+    );
+
+    speaks_v2.store(true, Ordering::SeqCst);
+    sleep(Duration::from_millis(5)).await;
+    sync.bootstrap().await.unwrap();
+
+    assert_eq!(
+        sync.link_status()
+            .iter()
+            .find(|s| s.id == 2)
+            .map(|s| s.protocol),
+        Some("v2"),
+        "the upgraded peer must be promoted without a restart"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Divergence detection and automatic repair
+// ---------------------------------------------------------------------------
+
+/// The failure v1 could not even see: two replicas whose deltas are empty — so both
+/// believe they are in sync — but whose states differ. The digest detects it and the
+/// manager repairs it by lowering coverage, which is only safe because the data map is
+/// never truncated.
+#[tokio::test]
+async fn persistently_mismatched_digests_trigger_an_automatic_repair() {
+    use crate::sync::{SyncConfig, SyncEnvelope};
+
+    let a = Node::new(1, vec![2]);
+    let b = Node::new(2, vec![1]);
+    a.write()
+        .put("only-on-a".to_string(), b"1".to_vec())
+        .unwrap();
+    b.write()
+        .put("only-on-b".to_string(), b"2".to_vec())
+        .unwrap();
+
+    // Manufacture the pathological state: each side claims full coverage of the other
+    // without ever having received its data.
+    let full_coverage = || {
+        let mut env = SyncEnvelope::new(0, vec![]);
+        env.acks.insert(1, 1);
+        env.acks.insert(2, 1);
+        env
+    };
+    let mut from_b = full_coverage();
+    from_b.sender_id = 2;
+    a.write().handle_envelope(from_b, vec![]).unwrap();
+    let mut from_a = full_coverage();
+    from_a.sender_id = 1;
+    b.write().handle_envelope(from_a, vec![]).unwrap();
+
+    assert_ne!(a.state_digest(), b.state_digest(), "the two have diverged");
+    assert!(
+        a.read().prepare_sync(2, vec![]).entries.is_empty(),
+        "and neither has anything to send, so v1 would never notice"
+    );
+
+    let sync = SyncManager::with_config(
+        a.clone(),
+        DirectLink { target: b.clone() },
+        SyncConfig {
+            digest_check_rounds: 2,
+            ..Default::default()
+        },
+    );
+
+    for _ in 0..4 {
+        sync.bootstrap().await.unwrap();
+    }
+
+    assert_eq!(
+        a.state_digest(),
+        b.state_digest(),
+        "the digest mismatch must escalate to a full re-exchange and converge"
+    );
+    assert!(a.read().get("only-on-b").is_some());
+    assert!(b.read().get("only-on-a").is_some());
+    assert_eq!(
+        sync.link_status()
+            .iter()
+            .find(|s| s.id == 2)
+            .map(|s| s.digest_mismatches),
+        Some(0),
+        "the counter resets once the pair agrees again"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Opportunistic push
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_push_queue_drains_and_is_bounded() {
+    use crate::NodeConfig;
+
+    let node = Node::with_config(
+        1,
+        vec![2],
+        NodeConfig {
+            max_delta_entries: 4,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        node.write().take_push_envelope().is_none(),
+        "nothing pending means no envelope and no allocation"
+    );
+
+    node.write().put("a".to_string(), b"1".to_vec()).unwrap();
+    node.write().put("b".to_string(), b"2".to_vec()).unwrap();
+    let env = node
+        .write()
+        .take_push_envelope()
+        .expect("two writes pending");
+    assert!(env.push_only, "R3: a push carries no ack authority");
+    assert!(env.acks.is_empty());
+    assert_eq!(env.entries.len(), 2);
+
+    assert!(
+        node.write().take_push_envelope().is_none(),
+        "taking the envelope must drain the queue, not copy it"
+    );
+
+    // Nothing draining: the backlog must stay bounded rather than growing forever.
+    for i in 0..20 {
+        node.write().put(format!("k{i}"), b"v".to_vec()).unwrap();
+    }
+    let env = node.write().take_push_envelope().expect("pending");
+    assert!(
+        env.entries.len() <= 4,
+        "the backlog must be bounded by max_delta_entries, got {}",
+        env.entries.len()
+    );
+}
+
+/// End to end: a local write reaches the peer via the push channel, well inside one
+/// sync interval.
+#[tokio::test]
+async fn a_local_write_reaches_the_peer_through_the_push_channel() {
+    use crate::sync::{ExchangeInterface, SyncConfig, SyncEnvelope, SyncMessage, SyncResponse};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct PushLink {
+        target: Node,
+    }
+
+    // Both sync legs are dead, so anything that reaches the peer can only have
+    // arrived over the push channel. (`tokio::time::interval` fires its first tick
+    // immediately, so leaving the periodic round working would deliver the write at
+    // startup and prove nothing.)
+    impl ExchangeInterface for PushLink {
+        async fn sync_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            _msg: SyncMessage,
+        ) -> anyhow::Result<SyncResponse> {
+            anyhow::bail!("the periodic round is disabled for this test")
+        }
+        async fn sync_v2_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            _env: SyncEnvelope,
+        ) -> anyhow::Result<Option<SyncEnvelope>> {
+            anyhow::bail!("the periodic round is disabled for this test")
+        }
+        async fn push_to(&self, _node: &Node, _peer: u32, env: SyncEnvelope) -> anyhow::Result<()> {
+            self.target.write().merge_push(env)
+        }
+    }
+
+    let local = Node::new(1, vec![2]);
+    let remote = Node::new(2, vec![1]);
+
+    let sync = Arc::new(SyncManager::with_config(
+        local.clone(),
+        PushLink {
+            target: remote.clone(),
+        },
+        SyncConfig {
+            // A periodic round this slow would never explain the propagation below.
+            interval: Duration::from_secs(3600),
+            coalesce_window: Some(Duration::from_millis(20)),
+            ..Default::default()
+        },
+    ));
+    sync.clone().start_sync_tasks().await;
+
+    local
+        .write()
+        .put("fresh".to_string(), b"v".to_vec())
+        .unwrap();
+    sync.notify_local_write();
+
+    for _ in 0..50 {
+        if remote.read().get("fresh").is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        remote.read().get("fresh").is_some(),
+        "the write should arrive via push, not wait for the hourly round"
+    );
+    assert!(
+        remote.read().get_including_tombstones("fresh").is_some(),
+        "sanity: the entry is really in the peer's map"
+    );
+    assert_eq!(
+        remote.read().acks_snapshot().get(&1).copied().unwrap_or(0),
+        0,
+        "R3: a push moves data but never coverage"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Remaining ingest guards
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn capacity_limits_refuse_new_keys_but_still_allow_updates() {
+    use crate::sync::SyncEnvelope;
+    use crate::types::{Entry, Metadata};
+    use crate::{Limits, NodeConfig};
+
+    let node = Node::with_config(
+        1,
+        vec![2],
+        NodeConfig {
+            limits: Limits {
+                max_keys: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let merge = |key: &str, seq: u64, value: &[u8]| {
+        let mut env = SyncEnvelope::new(2, vec![]);
+        env.entries.push(Entry::new(
+            key.to_string(),
+            Some(value.to_vec()),
+            Metadata::new(2, seq, seq as i64),
+        ));
+        env
+    };
+
+    let first = node.write().apply_envelope(merge("k1", 1, b"a")).unwrap();
+    assert_eq!(first.rejected, 0);
+
+    let second = node.write().apply_envelope(merge("k2", 2, b"b")).unwrap();
+    assert_eq!(second.rejected, 1, "a second key exceeds max_keys");
+    assert!(node.read().get("k2").is_none());
+
+    // Updating an existing key creates no new key, so capacity must not block it.
+    let update = node.write().apply_envelope(merge("k1", 3, b"c")).unwrap();
+    assert_eq!(update.rejected, 0);
+    assert_eq!(node.read().get("k1").unwrap().value, Some(b"c".to_vec()));
+}
+
+/// Node ids are the addressing scheme, so reusing one across two machines silently
+/// merges their sequence spaces. The UUID check is what catches that, and it must work
+/// on both the v1 and v2 entry points.
+#[tokio::test]
+async fn a_reused_node_id_is_rejected_on_both_protocols() {
+    use crate::sync::{ExchangeInterface, SyncEnvelope, SyncMessage, SyncResponse};
+
+    #[derive(Clone)]
+    struct KnownPeers;
+
+    impl ExchangeInterface for KnownPeers {
+        fn uuid(&self) -> Vec<u8> {
+            b"me".to_vec()
+        }
+        fn query_uuid(&self, node_id: u32) -> Option<Vec<u8>> {
+            (node_id == 2).then(|| b"the-real-node-2".to_vec())
+        }
+        async fn sync_to(
+            &self,
+            _node: &Node,
+            _peer: u32,
+            _msg: SyncMessage,
+        ) -> anyhow::Result<SyncResponse> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    let sync = SyncManager::new(Node::new(1, vec![2]), KnownPeers);
+
+    let mut impostor = SyncEnvelope::new(2, b"someone-else".to_vec());
+    impostor.acks.insert(2, 1);
+    let err = sync.handle_envelope(impostor).unwrap_err();
+    assert!(err.to_string().contains("UUID mismatch"), "{err}");
+
+    let v1_impostor = SyncMessage {
+        sender_id: 2,
+        sender_uuid: b"someone-else".to_vec(),
+        sender_ack: Default::default(),
+        entries: vec![],
+    };
+    let err = sync.handle_sync(v1_impostor).unwrap_err();
+    assert!(err.to_string().contains("UUID mismatch"), "{err}");
+
+    // The genuine peer is still served.
+    let genuine = SyncEnvelope::new(2, b"the-real-node-2".to_vec());
+    assert!(sync.handle_envelope(genuine).is_ok());
+}
