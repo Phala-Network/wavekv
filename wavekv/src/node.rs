@@ -1,6 +1,9 @@
+use crate::admission::{Admission, NodeConfig};
+use crate::delta::compute_delta;
+use crate::digest::StateDigest;
 use crate::ops::{CoreState, StateOp};
-use crate::sync::{SyncMessage, SyncResponse};
-use crate::types::{compare_entries, Entry, Metadata, NodeId, PeerState};
+use crate::sync::{SyncEnvelope, SyncMessage, SyncResponse};
+use crate::types::{compare_entries, Entry, Metadata, NodeId};
 use crate::wal::WriteAheadLog;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -10,11 +13,8 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, trace, warn};
-
-const DEFAULT_MAX_LOG_ENTRIES: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
@@ -23,29 +23,51 @@ pub struct NodeStatus {
     pub next_seq: u64,
     pub dirty: bool,
     pub wal: bool,
+    pub digest: String,
+    pub entries_merged: u64,
+    pub entries_rejected: u64,
     pub peers: Vec<PeerStatus>,
 }
 
+/// Per-peer view. Replaces v1's `{ack, pack, logs}`, which could not distinguish a
+/// healthy replica from a permanently diverged one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub id: NodeId,
+    /// How far we cover this origin's writes.
     pub ack: u64,
-    pub pack: u64,
-    pub logs: usize,
+    /// How far this peer told us it covers our writes.
+    pub peer_ack: u64,
+    /// Whether this peer has ever reported an ack map.
+    pub heard_from: bool,
+}
+
+/// What a merge round did, and whether the round may move acks.
+#[derive(Debug, Clone, Default)]
+pub struct MergeOutcome {
+    /// Entries that changed local state.
+    pub merged: usize,
+    /// Entries refused by limits or the admission policy.
+    pub rejected: usize,
+    /// True when the peer's delta was empty — one half of the quiescence test.
+    pub peer_delta_empty: bool,
+    /// `Some(true)`/`Some(false)` when both sides supplied a digest.
+    pub digest_match: Option<bool>,
+    /// Set when the peer paginated and more pages remain.
+    pub resume_from: Option<(NodeId, u64)>,
+    /// Whether acks were adopted this round (false if R1/R2/R3 blocked it).
+    pub acks_adopted: bool,
 }
 
 /// Core mutable state - all protected by a single RwLock for consistency
 pub struct NodeState {
     pub id: NodeId,
 
-    /// Core state: data + peers + next_seq
+    /// Core state: data + origin index + acks + next_seq
     core: CoreState,
 
-    // WAL for durability - included in state to ensure atomic updates
+    /// WAL for durability - included in state to ensure atomic updates
     wal: Option<WriteAheadLog>,
-
-    /// Maximum number of log entries to keep per node
-    max_log_entries: usize,
 
     /// Optional snapshot path for full state persistence
     snapshot_path: Option<PathBuf>,
@@ -55,6 +77,14 @@ pub struct NodeState {
 
     /// Tracks whether state has unpersisted changes
     dirty: bool,
+
+    config: NodeConfig,
+
+    /// Keys written locally since the last opportunistic push (RFC 3.9).
+    pending_push: Vec<String>,
+
+    entries_merged: u64,
+    entries_rejected: u64,
 }
 
 enum WatchPattern {
@@ -67,6 +97,9 @@ struct Watcher {
     sender: watch::Sender<()>,
 }
 
+/// On-disk container. Deliberately unchanged from v1 — same magic, same version, same
+/// body shape — so that a node can be rolled back to the v1 binary at any point during
+/// the migration (RFC 8.3). `CoreState`'s own `Serialize` impl does the projection.
 #[derive(Debug, Serialize, Deserialize)]
 struct SnapshotFile {
     magic: [u8; 4],
@@ -90,18 +123,18 @@ impl SnapshotFile {
 
     fn validate(&self, expected_node: NodeId) -> Result<()> {
         if self.magic != Self::MAGIC {
-            bail!("Invalid snapshot magic header");
+            bail!("invalid snapshot magic header");
         }
         if self.version != Self::VERSION {
             bail!(
-                "Unsupported snapshot version: expected {}, found {}",
+                "unsupported snapshot version: expected {}, found {}",
                 Self::VERSION,
                 self.version
             );
         }
         if self.node_id != expected_node {
             bail!(
-                "Snapshot node_id mismatch: expected {}, found {}",
+                "snapshot node_id mismatch: expected {}, found {}",
                 expected_node,
                 self.node_id
             );
@@ -110,15 +143,9 @@ impl SnapshotFile {
     }
 }
 
-/// Simplified store following design:
-/// - Pure in-memory KV + per-node bucketed logs
-/// - LWW conflict resolution
-/// - Single RwLock protecting all state for consistency
-/// - BTreeMap for prefix scanning capability
+/// Thread-safe handle to a WaveKV node.
 #[derive(Clone)]
 pub struct Node {
-    // All core state protected by single RwLock
-    // Includes WAL to ensure atomic updates
     state: Arc<RwLock<NodeState>>,
 }
 
@@ -126,28 +153,50 @@ impl NodeState {
     fn snapshot_path(&self) -> Result<&Path> {
         self.snapshot_path
             .as_deref()
-            .ok_or_else(|| anyhow!("Snapshot path not configured"))
+            .ok_or_else(|| anyhow!("snapshot path not configured"))
     }
 
     fn load_snapshot_if_exists(&mut self) -> Result<bool> {
         let Some(path) = self.snapshot_path.clone() else {
             return Ok(false);
         };
+        let backup = path.with_extension("snapshot.bak");
 
-        if !path.exists() {
-            return Ok(false);
+        for candidate in [&path, &backup] {
+            if !candidate.exists() {
+                continue;
+            }
+            match Self::read_snapshot(candidate, self.id) {
+                Ok(core) => {
+                    self.core = core;
+                    self.core.set_id(self.id);
+                    self.dirty = false;
+                    if candidate == &backup {
+                        warn!("primary snapshot unusable; recovered from {backup:?}");
+                    }
+                    return Ok(true);
+                }
+                Err(err) => {
+                    // WaveKV state is fully replicated, so local damage is a
+                    // quarantine-and-resync event, never a refusal to start.
+                    warn!("failed to load snapshot {candidate:?}: {err:#}");
+                }
+            }
         }
+        if path.exists() || backup.exists() {
+            warn!("no usable snapshot found; starting empty and re-syncing from peers");
+        }
+        Ok(false)
+    }
 
-        let mut reader = BufReader::new(File::open(&path)?);
+    fn read_snapshot(path: &Path, expected_node: NodeId) -> Result<CoreState> {
+        let mut reader = BufReader::new(File::open(path)?);
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
         let snapshot: SnapshotFile =
-            rmp_serde::from_slice(&buf).context("Failed to deserialize snapshot")?;
-        snapshot.validate(self.id)?;
-
-        self.core = snapshot.core;
-        self.dirty = false;
-        Ok(true)
+            rmp_serde::from_slice(&buf).context("failed to deserialize snapshot")?;
+        snapshot.validate(expected_node)?;
+        Ok(snapshot.core)
     }
 
     pub fn persist_to_disk(&mut self) -> Result<()> {
@@ -173,6 +222,11 @@ impl NodeState {
             writer.get_ref().sync_all()?;
         }
 
+        // Keep one previous generation as a fallback (RFC 3.10).
+        if snapshot_path.exists() {
+            let backup = snapshot_path.with_extension("snapshot.bak");
+            let _ = fs::rename(&snapshot_path, &backup);
+        }
         fs::rename(&tmp_path, &snapshot_path)?;
 
         if let Some(parent) = snapshot_path.parent() {
@@ -185,7 +239,7 @@ impl NodeState {
             wal.reset()?;
         }
 
-        info!("Persisted snapshot to {:?}", snapshot_path);
+        debug!("persisted snapshot to {:?}", snapshot_path);
         self.dirty = false;
         Ok(())
     }
@@ -196,7 +250,6 @@ impl NodeState {
                 WatchPattern::Exact(watch_key) => watch_key == key,
                 WatchPattern::Prefix(prefix) => key.starts_with(prefix),
             };
-
             if matches {
                 watcher.sender.send(()).is_ok()
             } else {
@@ -223,19 +276,20 @@ impl NodeState {
         receiver
     }
 
-    /// Execute state operations with WAL logging
-    /// This is the ONLY method that mutates state - all mutations go through here
+    /// Execute state operations, persisting the durable ones.
+    ///
+    /// v2's WAL carries only `Set`/`Clear`; ack bookkeeping is volatile by design, so
+    /// an idle sync round no longer costs an fsync.
     fn execute_ops(&mut self, ops: Vec<StateOp>) -> Result<()> {
         self.execute_ops_impl(ops, true)
     }
 
     fn execute_ops_impl(&mut self, ops: Vec<StateOp>, write_to_wal: bool) -> Result<()> {
-        // Filter out noops first
         let ops: Vec<_> = ops
             .into_iter()
             .filter(|op| {
                 if self.core.is_noop(op) {
-                    trace!("Skipping noop op: {op:?}");
+                    trace!("skipping noop op: {op:?}");
                     false
                 } else {
                     true
@@ -247,28 +301,27 @@ impl NodeState {
             return Ok(());
         }
 
-        // Batch write to WAL first for durability (single fsync)
         if write_to_wal {
             if let Some(wal) = self.wal.as_mut() {
-                wal.write_ops(&ops)?;
+                let durable: Vec<StateOp> =
+                    ops.iter().filter(|op| op.is_durable()).cloned().collect();
+                if !durable.is_empty() {
+                    wal.write_ops(&durable)?;
+                }
             }
         }
 
-        // Then execute all ops in memory
         for op in ops {
             self.execute_op(op);
         }
         self.mark_dirty();
-
         Ok(())
     }
 
-    /// Execute ops during recovery (no WAL writing)
     fn execute_op(&mut self, op: StateOp) {
-        let changed_key = if let StateOp::Set(ref entry) = op {
-            Some(entry.key.clone())
-        } else {
-            None
+        let changed_key = match &op {
+            StateOp::Set(entry) => Some(entry.key.clone()),
+            _ => None,
         };
         self.core.execute(op);
         if let Some(key) = changed_key {
@@ -276,101 +329,308 @@ impl NodeState {
         }
     }
 
-    /// Execute ops during recovery (no WAL writing)
     fn replay_ops(&mut self, ops: Vec<StateOp>) -> Result<()> {
         self.execute_ops_impl(ops, false)
     }
 
-    /// Sync an entry from another node (LWW resolution)
-    pub fn sync(&mut self, entry: Entry) -> Result<bool> {
-        debug!(entry.key, "Syncing entry, meta: {:?}", entry.meta);
+    // -----------------------------------------------------------------------
+    // Merge
+    // -----------------------------------------------------------------------
 
-        // Check LWW before applying
-        let should_update = if let Some(existing) = self.core.data().get(&entry.key) {
-            compare_entries(existing, &entry) == std::cmp::Ordering::Less
-        } else {
-            true
+    /// Admission checks applied to every entry arriving from a peer (RFC 3.8).
+    fn admit(&self, entry: &Entry, now_ms: i64) -> Admission {
+        if let Admission::Reject { reason } = self.config.limits.check_entry(entry) {
+            return Admission::Reject { reason };
+        }
+        if let Admission::Reject { reason } = self.config.limits.check_clock(entry, now_ms) {
+            return Admission::Reject { reason };
+        }
+        // Capacity is only consulted for keys that would be newly created.
+        if !self.core.data().contains_key(&entry.key) {
+            let bytes: usize = self
+                .core
+                .data()
+                .values()
+                .map(|e| e.key.len() + e.value.as_ref().map_or(0, |v| v.len()))
+                .sum();
+            if let Admission::Reject { reason } = self
+                .config
+                .limits
+                .check_capacity(self.core.data().len(), bytes)
+            {
+                return Admission::Reject { reason };
+            }
+        }
+        if let Some(policy) = &self.config.admission {
+            if let Admission::Reject { reason } = policy.admit(entry) {
+                return Admission::Reject { reason };
+            }
+        }
+        Admission::Accept
+    }
+
+    /// Merge one entry under LWW. Returns whether local state changed.
+    pub fn sync(&mut self, entry: Entry) -> Result<bool> {
+        let now = Utc::now().timestamp_millis();
+        match self.admit(&entry, now) {
+            Admission::Accept => {}
+            Admission::Reject { reason } => {
+                self.entries_rejected += 1;
+                bail!("entry {} rejected: {reason}", entry.key);
+            }
+        }
+
+        let should_update = match self.core.data().get(&entry.key) {
+            Some(existing) => compare_entries(existing, &entry) == std::cmp::Ordering::Less,
+            None => true,
         };
 
-        // Always update peer log if this is new
-        let mut ops = vec![StateOp::PushPeerLog {
-            peer_id: entry.meta.node,
-            entry: entry.clone(),
-            max_entries: self.max_log_entries,
-        }];
-
         if should_update {
-            ops.push(StateOp::Set(entry));
+            self.execute_ops(vec![StateOp::Set(entry)])
+                .context("failed to apply merged entry")?;
+            self.entries_merged += 1;
         }
-        self.execute_ops(ops)
-            .context("Failed to execute ops in sync")?;
-
         Ok(should_update)
     }
 
-    /// Update peer_ack: the peer tells us how far they've synced our logs
-    pub fn update_peer_ack(&mut self, peer_id: NodeId, ack_seq: u64) -> Result<()> {
-        self.execute_ops(vec![StateOp::UpdatePeerAck {
-            peer_id,
-            ack_seq,
-            monotonic: false,
-        }])
+    /// Merge a batch. Rule R1: a single failure blocks ack adoption for the whole
+    /// round. Merging is idempotent, so the retry next round costs nothing.
+    fn merge_batch(&mut self, entries: Vec<Entry>) -> (usize, usize, bool) {
+        let mut merged = 0usize;
+        let mut rejected = 0usize;
+        let mut complete = true;
+        for entry in entries {
+            let key = entry.key.clone();
+            match self.sync(entry) {
+                Ok(true) => merged += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    rejected += 1;
+                    complete = false;
+                    warn!("refusing entry {key}: {err:#}");
+                }
+            }
+        }
+        (merged, rejected, complete)
     }
 
-    /// Update local_ack from remote full dump progress
-    /// This ensures our local_ack is consistent with what the remote node has synced
-    fn update_local_ack(&mut self, progress: &HashMap<NodeId, u64>) -> Result<()> {
-        let ops: Vec<StateOp> = progress
+    // -----------------------------------------------------------------------
+    // v2 protocol
+    // -----------------------------------------------------------------------
+
+    /// Build the request envelope for `peer` (rule R4: one consistent snapshot).
+    pub fn prepare_sync(&self, peer: NodeId, uuid: Vec<u8>) -> SyncEnvelope {
+        let peer_view = self.core.peer_acks_for(peer).cloned().unwrap_or_default();
+        let delta = compute_delta(
+            self.core.data(),
+            self.core.origin_index(),
+            &peer_view,
+            None,
+            self.config.max_delta_entries,
+            self.config.max_delta_bytes,
+        );
+
+        let mut env = SyncEnvelope::new(self.id, uuid);
+        env.acks = self.core.acks().clone();
+        env.entries = delta.entries;
+        env.page = delta.page;
+        env.digest = Some(self.state_digest());
+        env
+    }
+
+    /// Build an opportunistic push envelope (rule R3: entries only).
+    pub fn prepare_push(&self, _peer: NodeId) -> SyncEnvelope {
+        let mut env = SyncEnvelope::new(self.id, Vec::new());
+        env.push_only = true;
+        env.entries = self
+            .pending_push
             .iter()
-            .map(|(&peer_id, &ack_seq)| StateOp::UpdateLocalAck {
-                peer_id,
-                ack_seq,
-                monotonic: true,
-            })
+            .filter_map(|key| self.core.data().get(key).cloned())
             .collect();
-        self.execute_ops(ops)
+        env
     }
 
-    pub fn apply_pulled_entries(&mut self, sync_message: SyncResponse) -> Result<()> {
-        if sync_message.is_snapshot {
-            debug!("Applying pulled snapshot");
-            self.update_local_ack(&sync_message.progress)?;
-        }
-        for entry in sync_message.entries {
-            self.sync(entry).context("Failed to sync entry")?;
-        }
-        let peer_ack = sync_message.progress.get(&self.id).copied().unwrap_or(0);
-        self.update_peer_ack(sync_message.peer_id, peer_ack)?;
-        Ok(())
+    pub fn take_pending_push(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_push)
     }
 
-    pub fn apply_pushed_entries(&mut self, sync_message: SyncMessage) -> Result<()> {
-        let Some(first) = sync_message.entries.first() else {
-            return Ok(());
-        };
-
-        let local_ack = self
-            .core
-            .peers()
-            .get(&sync_message.sender_id)
-            .map(|p| p.local_ack)
-            .unwrap_or(0);
-        let sender_id = sync_message.sender_id;
-        let expected_since = local_ack + 1;
-        let actual_since = first.meta.seq;
-        if actual_since > expected_since {
-            warn!(
-                sender_id,
-                expected_since, actual_since, "Received entries with gap"
+    /// Merge an opportunistically pushed envelope. Data only — never acks (R3).
+    pub fn merge_push(&mut self, env: SyncEnvelope) -> Result<()> {
+        if !env.push_only {
+            debug!(
+                "envelope from {} delivered on the push channel without push_only; \
+                 merging data only",
+                env.sender_id
             );
-            return Ok(());
         }
-
-        for entry in sync_message.entries {
-            self.sync(entry).context("Failed to sync entry")?;
-        }
+        self.merge_batch(env.entries);
         Ok(())
     }
+
+    /// Handle an inbound request envelope and produce the response (responder side).
+    pub fn handle_envelope(&mut self, env: SyncEnvelope, uuid: Vec<u8>) -> Result<SyncEnvelope> {
+        let peer = env.sender_id;
+        let requested_acks = env.acks.clone();
+        let resume_from = env.resume_from;
+        let reset = env.reset_acks;
+        let adoption_allowed = env.permits_ack_adoption();
+
+        let (_, _, complete) = self.merge_batch(env.entries);
+
+        // R1 + R2: adopt only after a complete merge of a complete delta.
+        if complete && adoption_allowed {
+            self.core.adopt_acks(&requested_acks);
+        }
+        self.core.record_peer_acks(peer, requested_acks.clone());
+
+        // R4: the response delta and the acks we claim come from the state as it is now,
+        // after the merge above, under this same guard.
+        let filter = if reset {
+            HashMap::new()
+        } else {
+            requested_acks
+        };
+        let delta = compute_delta(
+            self.core.data(),
+            self.core.origin_index(),
+            &filter,
+            resume_from,
+            self.config.max_delta_entries,
+            self.config.max_delta_bytes,
+        );
+
+        let mut response = SyncEnvelope::new(self.id, uuid);
+        response.acks = self.core.acks().clone();
+        response.entries = delta.entries;
+        response.page = delta.page;
+        response.digest = Some(self.state_digest());
+        Ok(response)
+    }
+
+    /// Consume a response envelope (initiator side).
+    pub fn apply_envelope(&mut self, env: SyncEnvelope) -> Result<MergeOutcome> {
+        let peer = env.sender_id;
+        let peer_acks = env.acks.clone();
+        let adoption_allowed = env.permits_ack_adoption();
+        let peer_digest = env.digest;
+        let resume_from = env
+            .page
+            .as_ref()
+            .and_then(|p| (!p.last).then_some(p.cursor));
+        let peer_delta_empty = env.entries.is_empty();
+
+        let (merged, rejected, complete) = self.merge_batch(env.entries);
+
+        let acks_adopted = complete && adoption_allowed;
+        if acks_adopted {
+            self.core.adopt_acks(&peer_acks);
+        }
+        self.core.record_peer_acks(peer, peer_acks);
+
+        let digest_match = peer_digest.map(|theirs| theirs == self.state_digest());
+
+        Ok(MergeOutcome {
+            merged,
+            rejected,
+            peer_delta_empty,
+            digest_match,
+            resume_from,
+            acks_adopted,
+        })
+    }
+
+    /// Drop our cached view of a peer's coverage and our own coverage claims, forcing a
+    /// full re-exchange. The repair half of the divergence loop (RFC 3.6).
+    ///
+    /// Always safe: the data map is never truncated, so a lowered ack can only cause
+    /// retransmission — never loss. This is precisely what v1 could not do.
+    pub fn reset_peer_coverage(&mut self, peer: NodeId) {
+        self.core.forget_peer_acks(peer);
+        self.core.reset_ack(Some(peer));
+    }
+
+    pub fn state_digest(&self) -> StateDigest {
+        StateDigest::compute(self.core.data())
+    }
+
+    pub fn acks_snapshot(&self) -> HashMap<NodeId, u64> {
+        self.core.acks().clone()
+    }
+
+    // -----------------------------------------------------------------------
+    // v1 compatibility shim (RFC 8.2.1)
+    // -----------------------------------------------------------------------
+
+    /// Serve a v1 peer.
+    ///
+    /// The pivot is `is_snapshot = true`: by v1 property P3 the client adopts
+    /// `progress` monotonically and then merges `entries`, which is exactly delta-state
+    /// adoption semantics. v1 clients thereby follow the v2 invariant without a code
+    /// change. What v1 *does* with the flag is what v2 needs; v1 never verifies the
+    /// flag's nominal meaning ("this is a full dump").
+    pub fn handle_sync_v1(&mut self, msg: SyncMessage) -> Result<SyncResponse> {
+        let peer = msg.sender_id;
+        let requested = msg.sender_ack.clone();
+
+        // Merge everything the v1 peer pushed. v1's gap concept does not apply here: a
+        // hole is a superseded write, and INV — not contiguity — governs ack movement.
+        self.merge_batch(msg.entries);
+
+        // Deliberately NOT adopting `sender_ack`: a v1 push carries only the sender's
+        // own log suffix, which is not a complete delta, so R1 forbids adoption.
+        self.core.record_peer_acks(peer, requested.clone());
+
+        // The response must be the *complete* delta, because the v1 client will adopt
+        // our progress map wholesale. Pagination is therefore disabled on this path —
+        // a partial delta paired with a full progress claim is exactly the hole INV
+        // forbids, and v1 has no way to signal "more pages follow".
+        let delta = compute_delta(
+            self.core.data(),
+            self.core.origin_index(),
+            &requested,
+            None,
+            usize::MAX,
+            usize::MAX,
+        );
+        debug_assert!(delta.page.is_none(), "the v1 shim must never paginate");
+
+        Ok(SyncResponse {
+            peer_id: self.id,
+            entries: delta.entries,
+            progress: self.core.acks().clone(),
+            is_snapshot: true,
+        })
+    }
+
+    /// Consume a v1 peer's response to our (empty) v1 push.
+    pub fn apply_v1_response(&mut self, resp: SyncResponse) -> Result<()> {
+        let peer = resp.peer_id;
+        let progress = resp.progress.clone();
+        let is_snapshot = resp.is_snapshot;
+
+        let (_, _, complete) = self.merge_batch(resp.entries);
+
+        // Only a v1 full dump is a complete delta. v1's incremental path silently skips
+        // origins whose logs were truncated below our ack (`get_peer_missing_logs`
+        // `continue`s), so adopting after an incremental response could claim coverage
+        // of writes we never received. Declining costs one retransmission per round and
+        // resolves itself: our ack stays put, so the peer's log eventually cannot cover
+        // it and v1 escalates to a full dump, which we do adopt.
+        if complete && is_snapshot {
+            self.core.adopt_acks(&progress);
+        } else if complete {
+            trace!(
+                peer,
+                "declining ack adoption from an incremental v1 response"
+            );
+        }
+        self.core.record_peer_acks(peer, progress);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Writes
+    // -----------------------------------------------------------------------
 
     fn alloc_entry_meta(&mut self) -> Metadata {
         let seq = self.core.next_seq();
@@ -379,24 +639,56 @@ impl NodeState {
         Metadata::new(self.id, seq, timestamp)
     }
 
+    fn record_own_write(&mut self, entry: &Entry) {
+        // Our own writes are allocated in order, so we cover them contiguously.
+        self.core.bump_ack(self.id, entry.meta.seq);
+        if self.config.coalesce_window.is_some() {
+            self.pending_push.push(entry.key.clone());
+        }
+    }
+
     pub fn put(&mut self, key: String, value: impl Into<Vec<u8>>) -> Result<Entry> {
-        let value = value.into();
         let meta = self.alloc_entry_meta();
-        let entry = Entry::new(key.clone(), Some(value), meta);
-
-        // Compile to StateOp sequence
-        let ops = vec![
-            StateOp::PushPeerLog {
-                peer_id: self.id,
-                entry: entry.clone(),
-                max_entries: self.max_log_entries,
-            },
-            StateOp::Set(entry.clone()),
-        ];
-
-        self.execute_ops(ops)?;
+        let entry = Entry::new(key, Some(value.into()), meta);
+        self.execute_ops(vec![StateOp::Set(entry.clone())])?;
+        self.record_own_write(&entry);
         Ok(entry)
     }
+
+    /// Write with a timestamp guaranteed to beat the current winner.
+    ///
+    /// The operator escape hatch for a key poisoned by a peer with a runaway clock:
+    /// plain `put` would lose LWW against a far-future stamp until real time catches up.
+    pub fn force_put(&mut self, key: String, value: impl Into<Vec<u8>>) -> Result<Entry> {
+        let seq = self.core.next_seq();
+        self.core.execute(StateOp::IncrementSeq);
+        let now = Utc::now().timestamp_millis();
+        let timestamp = match self.core.data().get(&key) {
+            Some(existing) => now.max(existing.meta.timestamp.saturating_add(1)),
+            None => now,
+        };
+        let entry = Entry::new(
+            key,
+            Some(value.into()),
+            Metadata::new(self.id, seq, timestamp),
+        );
+        self.execute_ops(vec![StateOp::Set(entry.clone())])?;
+        self.record_own_write(&entry);
+        Ok(entry)
+    }
+
+    pub fn delete(&mut self, key: String) -> Result<Option<Entry>> {
+        let meta = self.alloc_entry_meta();
+        let tombstone = Entry::new(key.clone(), None, meta);
+        let previous = self.core.data().get(&key).cloned();
+        self.execute_ops(vec![StateOp::Set(tombstone.clone())])?;
+        self.record_own_write(&tombstone);
+        Ok(previous)
+    }
+
+    // -----------------------------------------------------------------------
+    // Reads
+    // -----------------------------------------------------------------------
 
     pub fn get(&self, key: &str) -> Option<Entry> {
         self.core
@@ -406,20 +698,16 @@ impl NodeState {
             .filter(|entry| entry.value.is_some())
     }
 
-    /// Get items including tombstones by key (for debugging)
     pub fn get_including_tombstones(&self, key: &str) -> Option<Entry> {
         self.core.data().get(key).cloned()
     }
 
-    /// Get items by prefix (for range scans) - returns owned data
-    /// For zero-copy iteration, use `iter_by_prefix` instead
     pub fn get_by_prefix(&self, prefix: &str) -> HashMap<String, Entry> {
         self.iter_by_prefix(prefix)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
 
-    /// Iterate items by prefix without cloning (zero-copy)
     pub fn iter_by_prefix<'a, 'b>(
         &'a self,
         prefix: &'b str,
@@ -431,215 +719,121 @@ impl NodeState {
             .filter(|(_, v)| v.value.is_some())
     }
 
-    /// Get all items including tombstones - returns owned data
-    /// For zero-copy iteration, use `iter_all_including_tombstones` instead
     pub fn get_all_including_tombstones(&self) -> HashMap<String, Entry> {
         self.iter_all_including_tombstones()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
 
-    /// Iterate all items including tombstones without cloning (zero-copy)
     pub fn iter_all_including_tombstones(&self) -> impl Iterator<Item = (&String, &Entry)> {
         self.core.data().iter()
     }
 
-    pub fn delete(&mut self, key: String) -> Result<Option<Entry>> {
-        let meta = self.alloc_entry_meta();
-        let tombstone = Entry::new(key.clone(), None, meta);
+    // -----------------------------------------------------------------------
+    // Membership and maintenance
+    // -----------------------------------------------------------------------
 
-        let previous = self.core.data().get(&key).cloned();
-
-        // Compile to StateOp sequence
-        let ops = vec![
-            StateOp::PushPeerLog {
-                peer_id: self.id,
-                entry: tombstone.clone(),
-                max_entries: self.max_log_entries,
-            },
-            StateOp::Set(tombstone),
-        ];
-
-        self.execute_ops(ops)?;
-        Ok(previous)
-    }
-
-    /// Get missing log entries for a peer based on their progress
-    /// If peer has progress for all nodes, returns only missing entries
-    /// Otherwise returns all entries across all nodes that peer hasn't seen yet
-    pub fn get_peer_missing_logs(
-        &self,
-        peer_progress: &HashMap<NodeId, u64>,
-    ) -> Option<Vec<Entry>> {
-        // If peer has no progress at all, return None to indicate full dump needed
-        if peer_progress.is_empty() {
-            debug!("Peer has no progress, returning full dump");
-            return None;
-        }
-
-        let mut missing_entries = Vec::new();
-
-        // Send logs from all nodes that we have
-        for (node_id, peer_state) in self.core.peers().iter() {
-            let node_log = &peer_state.log;
-            let peer_ack = peer_progress.get(node_id).cloned().unwrap_or(0);
-
-            // Check if requested start_seq is still available (not truncated)
-            if let Some(oldest_entry) = node_log.front() {
-                if peer_ack < oldest_entry.meta.seq {
-                    if node_id == &self.id {
-                        // Requested seq has been truncated, need full dump
-                        debug!(
-                            node_id,
-                            peer_ack,
-                            oldest_log = oldest_entry.meta.seq,
-                            "Requested my seq has been truncated, need full dump"
-                        );
-                        return None;
-                    } else {
-                        debug!(
-                            node_id,
-                            peer_ack,
-                            oldest_log = oldest_entry.meta.seq,
-                            "Requested peer seq has been truncated, skipping"
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            // Collect entries after the start sequence
-            for entry in node_log {
-                if entry.meta.seq > peer_ack {
-                    missing_entries.push(entry.clone());
-                }
-            }
-        }
-
-        Some(missing_entries)
-    }
-
-    /// Convert current KV state to log entries (for full dump)
-    pub fn kv_to_log_entries(&self) -> Vec<Entry> {
-        self.core.data().values().cloned().collect()
-    }
-
-    /// Get local_ack for all nodes (for sync message)
-    /// Returns: HashMap<NodeId, u64> where value is local_ack
-    pub fn get_local_ack(&self) -> HashMap<NodeId, u64> {
-        // Return our local_ack for all nodes: how far we've synced each node's logs
-        // For self, local_ack represents how far we've "synced" our own logs (i.e., generated)
-        self.core
-            .peers()
-            .iter()
-            .map(|(id, peer_state)| (*id, peer_state.local_ack))
-            .collect()
-    }
-
-    /// Get peer node IDs (excluding self)
     pub fn get_peers(&self) -> Vec<NodeId> {
         self.core
-            .peers()
-            .keys()
+            .members()
+            .iter()
             .filter(|&&id| id != self.id)
             .copied()
             .collect()
     }
 
-    /// Add a new peer node (dynamic membership)
-    pub fn add_peer(&mut self, peer_id: NodeId) -> Result<bool> {
-        if self.core.peers().contains_key(&peer_id) {
-            return Ok(false);
-        }
-        let ops = vec![StateOp::AddPeer { peer_id }];
-        self.execute_ops(ops)?;
-        info!("Added peer node: {}", peer_id);
-        Ok(true)
-    }
-
-    /// Remove a peer node (dynamic membership)
-    pub fn remove_peer(&mut self, peer_id: NodeId) -> Result<bool> {
-        if peer_id == self.id || !self.core.peers().contains_key(&peer_id) {
-            return Ok(false);
-        }
-        let ops = vec![StateOp::RemovePeer { peer_id }];
-        self.execute_ops(ops)?;
-        info!("Removed peer node: {}", peer_id);
-        Ok(true)
-    }
-
-    /// Get all known nodes (all keys in peers map)
     pub fn get_all_nodes(&self) -> Vec<NodeId> {
-        self.core.peers().keys().copied().collect()
+        self.core.members().to_vec()
     }
 
-    /// Get peer state for a specific node
-    pub fn get_peer_state(&self, node_id: NodeId) -> Option<PeerState> {
-        self.core.peers().get(&node_id).cloned()
+    pub fn add_peer(&mut self, peer_id: NodeId) -> Result<bool> {
+        if self.core.members().contains(&peer_id) {
+            return Ok(false);
+        }
+        self.execute_ops(vec![StateOp::AddPeer { peer_id }])?;
+        info!("added peer node: {peer_id}");
+        Ok(true)
     }
 
-    /// Get peer state for a specific node
-    pub fn get_peer_logs_since(&self, node_id: NodeId, since: u64) -> Option<Vec<Entry>> {
-        let peer_state = self.core.peers().get(&node_id)?;
-        let log = &peer_state.log;
-        // Find first entry with seq > since
-        let since_index = log.iter().position(|entry| entry.meta.seq > since)?;
-        Some(log.iter().skip(since_index).cloned().collect())
+    pub fn remove_peer(&mut self, peer_id: NodeId) -> Result<bool> {
+        if peer_id == self.id || !self.core.members().contains(&peer_id) {
+            return Ok(false);
+        }
+        self.execute_ops(vec![StateOp::RemovePeer { peer_id }])?;
+        info!("removed peer node: {peer_id}");
+        Ok(true)
     }
 
-    /// Cleanup expired tombstones
-    pub fn cleanup_expired_tombstones(&mut self, ttl: Duration) -> Result<usize> {
-        let now = Utc::now().timestamp_millis();
-        let ttl_ms = ttl.as_millis() as i64;
+    /// Collect tombstones every known peer has already covered (RFC section 6).
+    ///
+    /// A tombstone authored by origin `n` at seq `s` may be cleared only once every
+    /// known peer reports `peer_acks[p][n] >= s`. v1's local-clock TTL is gone: under
+    /// any state-shipping scheme an uncoordinated GC lets a lagging replica resurrect a
+    /// deleted key — for dstack-gateway, a deregistered CVM reappearing in every node's
+    /// WireGuard config.
+    ///
+    /// Caveat (accepted, documented): the watermark spans *known* peers, so a
+    /// permanently retired peer pins GC until `remove_peer` is called for it.
+    pub fn collect_tombstone_garbage(&mut self) -> Result<usize> {
+        let peers = self.get_peers();
+        if peers.is_empty() {
+            // A single-node cluster has nobody to resurrect from.
+            let keys: Vec<String> = self
+                .core
+                .data()
+                .iter()
+                .filter(|(_, e)| e.is_deleted())
+                .map(|(k, _)| k.clone())
+                .collect();
+            let removed = keys.len();
+            self.execute_ops(keys.into_iter().map(StateOp::Clear).collect())?;
+            return Ok(removed);
+        }
 
-        let expired_keys = self
+        let watermark = |origin: NodeId| -> Option<u64> {
+            let mut low = u64::MAX;
+            for peer in &peers {
+                let reported = self
+                    .core
+                    .peer_acks_for(*peer)
+                    .and_then(|m| m.get(&origin).copied())?;
+                low = low.min(reported);
+            }
+            Some(low)
+        };
+
+        let collectable: Vec<String> = self
             .core
             .data()
             .iter()
-            .flat_map(|(k, item)| {
-                if item.is_expired_tombstone(ttl_ms, now) {
-                    Some(StateOp::Clear(k.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+            .filter(|(_, entry)| entry.is_deleted())
+            .filter(|(_, entry)| watermark(entry.meta.node).is_some_and(|w| w >= entry.meta.seq))
+            .map(|(key, _)| key.clone())
+            .collect();
 
-        let removed = expired_keys.len();
-        self.execute_ops(expired_keys)?;
+        let removed = collectable.len();
+        self.execute_ops(collectable.into_iter().map(StateOp::Clear).collect())?;
+        if removed > 0 {
+            debug!("collected {removed} fully-replicated tombstones");
+        }
         Ok(removed)
     }
 
-    /// Get a snapshot of all logs (for demo/debugging)
-    pub fn get_log_snapshot(&self) -> Vec<Entry> {
-        let mut all_entries = Vec::new();
-
-        for peer_state in self.core.peers().values() {
-            let entries = &peer_state.log;
-            all_entries.extend(entries.iter().cloned());
+    /// Recover `next_seq` from the live index after a restart or bootstrap.
+    /// One range scan, replacing v1's walk over every log bucket plus the data map.
+    pub fn recover_next_seq(&mut self) {
+        let max_own = self.core.max_own_seq();
+        if max_own > 0 {
+            self.core.execute(StateOp::SetNextSeq(max_own + 1));
         }
-
-        // Sort by timestamp and node_id for consistent ordering
-        all_entries.sort_by_key(|e| (e.meta.timestamp, e.meta.node, e.meta.seq));
-
-        all_entries
     }
 
-    /// Update next_seq to ensure it's at least the given value
-    /// Used during bootstrap to avoid sequence number reuse
     pub fn ensure_next_seq(&mut self, min_next_seq: u64) {
-        let ops = vec![StateOp::SetNextSeq(min_next_seq)];
-        let _ = self.execute_ops(ops);
+        self.core.execute(StateOp::SetNextSeq(min_next_seq));
     }
 
-    /// Get current next_seq value (for debugging/monitoring)
     pub fn get_next_seq(&self) -> u64 {
         self.core.next_seq()
-    }
-
-    /// Get all peer states (for bootstrap scanning)
-    pub fn get_all_peer_states(&self) -> &HashMap<NodeId, PeerState> {
-        self.core.peers()
     }
 
     fn persist_if_dirty(&mut self) -> Result<bool> {
@@ -655,19 +849,23 @@ impl NodeState {
         self.dirty = true;
     }
 
-    /// Get node status (for debugging/monitoring)
     pub fn status(&self) -> NodeStatus {
-        let peers: Vec<PeerStatus> = self
+        let mut peers: Vec<PeerStatus> = self
             .core
-            .peers()
+            .members()
             .iter()
-            .map(|(peer_id, peer_state)| PeerStatus {
-                id: *peer_id,
-                ack: peer_state.local_ack,
-                pack: peer_state.peer_ack,
-                logs: peer_state.log.len(),
+            .map(|&id| PeerStatus {
+                id,
+                ack: self.core.ack_for(id),
+                peer_ack: self
+                    .core
+                    .peer_acks_for(id)
+                    .and_then(|m| m.get(&self.id).copied())
+                    .unwrap_or(0),
+                heard_from: self.core.peer_acks_for(id).is_some(),
             })
             .collect();
+        peers.sort_by_key(|p| p.id);
 
         NodeStatus {
             id: self.id,
@@ -675,6 +873,9 @@ impl NodeState {
             next_seq: self.core.next_seq(),
             dirty: self.dirty,
             wal: self.wal.is_some(),
+            digest: self.state_digest().to_hex(),
+            entries_merged: self.entries_merged,
+            entries_rejected: self.entries_rejected,
             peers,
         }
     }
@@ -682,96 +883,94 @@ impl NodeState {
 
 impl Node {
     pub fn new(id: NodeId, peer_ids: Vec<NodeId>) -> Self {
-        let core = CoreState::new(id, peer_ids);
+        Self::with_config(id, peer_ids, NodeConfig::default())
+    }
 
+    pub fn with_config(id: NodeId, peer_ids: Vec<NodeId>, config: NodeConfig) -> Self {
         let state = NodeState {
             id,
-            core,
-            wal: None, // No WAL by default
-            max_log_entries: DEFAULT_MAX_LOG_ENTRIES,
+            core: CoreState::new(id, peer_ids),
+            wal: None,
             snapshot_path: None,
             watchers: Vec::new(),
             dirty: false,
+            config,
+            pending_push: Vec::new(),
+            entries_merged: 0,
+            entries_rejected: 0,
         };
-
         Self {
             state: Arc::new(RwLock::new(state)),
         }
     }
 
-    /// Create a new store with persistence enabled
     pub fn new_with_persistence<P: Into<PathBuf>>(
         id: NodeId,
         peers: Vec<NodeId>,
         data_dir: P,
     ) -> Result<Self> {
+        Self::with_persistence_and_config(id, peers, data_dir, NodeConfig::default())
+    }
+
+    pub fn with_persistence_and_config<P: Into<PathBuf>>(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        data_dir: P,
+        config: NodeConfig,
+    ) -> Result<Self> {
         let data_dir = data_dir.into();
         let wal_path = data_dir.join(format!("node_{id}.wal"));
         let snapshot_path = data_dir.join(format!("node_{id}.snapshot"));
 
-        // Ensure directory exists
         if let Some(parent) = wal_path.parent() {
             fs_err::create_dir_all(parent)?;
         }
 
         let wal = WriteAheadLog::new(&wal_path, id)?;
-
-        // Read existing log operations for recovery
         let existing_ops = wal.read_all_ops()?;
-
-        // Initialize core state
-        let core = CoreState::new(id, peers);
 
         let mut state = NodeState {
             id,
-            core,
+            core: CoreState::new(id, peers),
             wal: Some(wal),
-            max_log_entries: DEFAULT_MAX_LOG_ENTRIES,
             snapshot_path: Some(snapshot_path.clone()),
             watchers: Vec::new(),
             dirty: false,
+            config,
+            pending_push: Vec::new(),
+            entries_merged: 0,
+            entries_rejected: 0,
         };
 
-        let loaded = state.load_snapshot_if_exists()?;
-        if loaded {
-            info!("Loaded snapshot from {}", snapshot_path.display());
-            let status = state.status();
-            info!("Node status: {:#?}", status);
+        if state.load_snapshot_if_exists()? {
+            info!("loaded snapshot from {}", snapshot_path.display());
         }
 
-        // Recover from WAL if needed
         if !existing_ops.is_empty() {
             info!(
-                "Recovering {} state operations from WAL",
+                "recovering {} state operations from WAL",
                 existing_ops.len()
             );
             state.replay_ops(existing_ops)?;
-            let status = state.status();
-            info!("Node status after recovery: {:#?}", status);
         }
+        // A v1 WAL/snapshot pair may leave next_seq behind the entries it replayed.
+        state.recover_next_seq();
 
-        let store = Self {
+        Ok(Self {
             state: Arc::new(RwLock::new(state)),
-        };
-
-        info!(
-            "Persistence enabled: WAL={:?}, snapshot={:?}",
-            wal_path, snapshot_path
-        );
-        Ok(store)
+        })
     }
 
-    pub fn write(&self) -> RwLockWriteGuard<NodeState> {
+    pub fn write(&self) -> RwLockWriteGuard<'_, NodeState> {
         #[allow(clippy::expect_used)]
         self.state.write().expect("lock should never fail")
     }
 
-    pub fn read(&self) -> RwLockReadGuard<NodeState> {
+    pub fn read(&self) -> RwLockReadGuard<'_, NodeState> {
         #[allow(clippy::expect_used)]
         self.state.read().expect("lock should never fail")
     }
 
-    /// Persist current state to disk snapshot (resets WAL)
     pub fn persist(&self) -> Result<()> {
         self.write().persist_to_disk()
     }
@@ -780,12 +979,14 @@ impl Node {
         self.write().persist_if_dirty()
     }
 
-    /// Watch a specific key for changes. Receiver notifies on any change to the key.
+    pub fn state_digest(&self) -> StateDigest {
+        self.read().state_digest()
+    }
+
     pub fn watch(&self, key: &str) -> watch::Receiver<()> {
         self.write().watch_key(key)
     }
 
-    /// Watch keys sharing a prefix. Receiver notifies on any change to matching keys.
     pub fn watch_prefix(&self, prefix: &str) -> watch::Receiver<()> {
         self.write().watch_prefix(prefix)
     }

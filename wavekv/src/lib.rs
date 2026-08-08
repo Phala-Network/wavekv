@@ -52,13 +52,20 @@
 //!
 //! For more details, see the [README](https://github.com/Phala-Network/wavekv).
 
+pub mod admission;
+pub mod delta;
+pub mod digest;
 pub mod node;
 pub mod ops;
 pub mod sync;
 pub mod types;
 pub mod wal;
 
+pub use admission::{Admission, AdmissionPolicy, Limits, NodeConfig};
+pub use delta::PageInfo;
+pub use digest::StateDigest;
 pub use node::Node;
+pub use sync::SyncEnvelope;
 
 #[cfg(test)]
 mod tests;

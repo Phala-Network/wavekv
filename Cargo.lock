@@ -454,7 +454,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "wavekv",
+ "wavekv 2.0.0",
 ]
 
 [[package]]
@@ -2191,6 +2191,29 @@ dependencies = [
 [[package]]
 name = "wavekv"
 version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf9b73bc556dfdb7ef33617a9d477b803198db43ea3df25463efaf43d4986fe8"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "chrono",
+ "crc32fast",
+ "dashmap",
+ "fs-err",
+ "futures",
+ "hex",
+ "rmp-serde",
+ "serde",
+ "serde-human-bytes",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "wavekv"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -2210,6 +2233,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wavekv 1.0.0",
 ]
 
 [[package]]
