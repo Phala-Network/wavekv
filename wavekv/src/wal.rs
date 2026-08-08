@@ -241,9 +241,18 @@ impl WriteAheadLog {
     }
 
     /// Read all state operations from the WAL for recovery
+    /// Replay every op in the WAL.
+    ///
+    /// A torn or corrupt tail is treated as truncation — warn and stop — rather than as
+    /// a fatal error. WaveKV state is fully replicated, so the correct response to local
+    /// persistence damage is to quarantine the damaged suffix and re-sync from peers,
+    /// never a permanent refusal to start (RFC 0001 section 3.10). This also matches the
+    /// behaviour `find_last_sequence` already had on the write path.
     pub fn read_all_ops(&self) -> Result<Vec<StateOp>> {
         let file = File::open(&self.file_path)?;
+        let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
+        let mut consumed = 0u64;
 
         // Skip header
         let header = self.read_header(&mut reader)?;
@@ -272,27 +281,49 @@ impl WriteAheadLog {
                 }
             };
 
+            consumed += 4;
+            // A corrupt length field must not turn into a multi-gigabyte allocation.
+            let remaining = file_len.saturating_sub(consumed);
+            if entry_len as u64 > remaining {
+                warn!(
+                    "WAL entry claims {entry_len} bytes but only {remaining} remain; \
+                     treating the tail as truncated and stopping replay"
+                );
+                break;
+            }
+
             let mut entry_bytes = vec![0u8; entry_len as usize];
             match reader.read_exact(&mut entry_bytes) {
                 Ok(_) => {}
                 Err(err) => {
                     if err.kind() == ErrorKind::UnexpectedEof {
                         warn!(
-                            "Encountered truncated WAL entry (expected {} bytes); stopping replay",
-                            entry_len
+                            "encountered truncated WAL entry (expected {entry_len} bytes); \
+                             stopping replay"
                         );
                         break;
                     }
-                    Err(err).context("Failed to read WAL entry")?;
+                    Err(err).context("failed to read WAL entry")?;
                 }
             }
-            let (wal_entry, _) = bincode::serde::decode_from_slice::<WalEntry, _>(
+            consumed += entry_len as u64;
+
+            let wal_entry = match bincode::serde::decode_from_slice::<WalEntry, _>(
                 &entry_bytes,
                 bincode::config::standard(),
-            )
-            .context("Failed to deserialize WAL entry")?;
+            ) {
+                Ok((entry, _)) => entry,
+                Err(err) => {
+                    warn!("undecodable WAL entry ({err}); treating the tail as truncated");
+                    break;
+                }
+            };
             if !wal_entry.verify_checksum() {
-                bail!("WAL entry corrupted");
+                // The checksum covers the canonical encoding of `state_op`, so this
+                // also catches a format drift that happened to decode into a different
+                // op — not just bit rot.
+                warn!("WAL entry failed its checksum; treating the tail as truncated");
+                break;
             }
             entries.push(wal_entry.state_op);
         }
