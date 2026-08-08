@@ -5,7 +5,7 @@ WaveKV is an embeddable Rust library for building distributed key-value stores. 
 **Key characteristics:**
 - **Peer-to-peer architecture**: All nodes have equal roles. No leader, no coordinator, no special node types.
 - **No minimum cluster size**: Works with a single node or any number of nodes. Scale freely without reconfiguration.
-- **Last-write-wins conflict resolution**: Conflicts are resolved automatically based on `(timestamp, origin node id)`. Simple and deterministic.
+- **Last-write-wins conflict resolution**: Conflicts are resolved automatically based on `(timestamp, origin node id, seq)`. Simple and deterministic.
 - **Eventually consistent**: Delta-state replication ensures all nodes converge to the same state. No transactions or quorum reads/writes.
 - **Embeddable library**: Not a standalone application. Designed to be embedded into your Rust programs.
 - **Core only**: Provides the replication algorithm and state management. Network transport is left to the application layer.
@@ -23,7 +23,7 @@ WaveKV is an embeddable Rust library for building distributed key-value stores. 
 
 WaveKV intentionally does NOT provide:
 
-- **Strong consistency or linearizability**: Only eventual consistency with last-writer-wins based on `(timestamp, origin node id)`.
+- **Strong consistency or linearizability**: Only eventual consistency with last-writer-wins based on `(timestamp, origin node id, seq)`.
 - **ACID transactions or CAS**: No transactional isolation, no compare-and-swap operations.
 - **Authentication or access control**: No built-in security mechanisms.
 - **Production-grade durability**: WAL preallocates and fsyncs, but there are no comprehensive checkpoints beyond the snapshot files used by the demo scripts.

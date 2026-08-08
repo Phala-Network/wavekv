@@ -14,7 +14,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::watch;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
@@ -184,7 +184,10 @@ impl NodeState {
             }
         }
         if path.exists() || backup.exists() {
-            warn!("no usable snapshot found; starting empty and re-syncing from peers");
+            // A snapshot was on disk and neither generation could be read. Recovery is
+            // automatic only while a peer is reachable; a node that starts empty and
+            // alone serves empty state, so this is louder than the per-file warning.
+            error!("no usable snapshot found; starting empty and re-syncing from peers");
         }
         Ok(false)
     }

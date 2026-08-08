@@ -112,6 +112,12 @@ pub struct NodeConfig {
     /// declares divergence and forces a full re-exchange.
     pub digest_check_rounds: u32,
     /// Coalescing window for opportunistic push. `None` disables push entirely.
+    /// Coalescing window for opportunistic push.
+    ///
+    /// Must agree with [`SyncConfig::coalesce_window`](crate::sync::SyncConfig): this
+    /// one gates whether a local write is recorded into `pending_push`, that one gates
+    /// whether the push loop runs at all. Setting only the other leaves the loop
+    /// spinning over a queue nothing ever fills.
     pub coalesce_window: Option<Duration>,
     pub max_delta_entries: usize,
     pub max_delta_bytes: usize,
