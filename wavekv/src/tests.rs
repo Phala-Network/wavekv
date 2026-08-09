@@ -1380,6 +1380,127 @@ async fn repair_recovers_an_entry_authored_by_a_third_node() {
     assert_eq!(a.state_digest(), b.node().state_digest());
 }
 
+/// R1 says acks may be adopted only after a *complete* merge. Across a paginated round
+/// that has to mean every page, but completeness was evaluated per envelope and the
+/// page loop carried no state between iterations.
+///
+/// So a round whose first page is partly refused and whose last page merges cleanly
+/// ends with the initiator adopting the peer's full ack map — claiming coverage of the
+/// very entry it just refused. Unpaged, the same refusal correctly parks the acks and
+/// the entry is retransmitted next round; pagination turned a visible retransmit into a
+/// silent, permanent hole.
+#[tokio::test]
+async fn a_refusal_on_an_early_page_blocks_adoption_at_the_end_of_the_round() {
+    use crate::delta::PageInfo;
+    use crate::sync::{SyncConfig, SyncEnvelope, SyncMessage, SyncResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn epoch_millis() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_millis() as i64
+    }
+
+    #[derive(Clone)]
+    struct Paginates {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::sync::ExchangeInterface for Paginates {
+        fn uuid(&self) -> Vec<u8> {
+            uuid_for(1)
+        }
+        fn query_uuid(&self, node: NodeId) -> Option<Vec<u8>> {
+            Some(uuid_for(node))
+        }
+        async fn sync_to(
+            &self,
+            _n: &Node,
+            _p: NodeId,
+            _m: SyncMessage,
+        ) -> anyhow::Result<SyncResponse> {
+            anyhow::bail!("v2 only")
+        }
+        async fn sync_v2_to(
+            &self,
+            _n: &Node,
+            _p: NodeId,
+            _env: SyncEnvelope,
+        ) -> anyhow::Result<Option<SyncEnvelope>> {
+            let mut env = SyncEnvelope::new(2, uuid_for(2));
+            env.acks.insert(2, 5);
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Page one: a single entry stamped far enough ahead to be refused.
+                env.entries = vec![Entry::new_put(
+                    Metadata::new(2, 1, epoch_millis() + 86_400_000),
+                    "refused".into(),
+                    b"v".to_vec(),
+                )];
+                env.page = Some(PageInfo {
+                    cursor: (2, 1),
+                    last: false,
+                });
+            }
+            // Any later page: clean and final (production signals "final" with `None`).
+            Ok(Some(env))
+        }
+    }
+
+    let a = Node::new(1, vec![2]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sync = SyncManager::with_config(
+        a.clone(),
+        Paginates {
+            calls: calls.clone(),
+        },
+        SyncConfig::default(),
+    );
+    sync.bootstrap().await.unwrap();
+
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "the round must have paginated"
+    );
+    assert!(
+        a.read().get("refused").is_none(),
+        "the fixture depends on that entry being refused"
+    );
+    assert_eq!(
+        a.read().acks_snapshot().get(&2).copied().unwrap_or(0),
+        0,
+        "adopting here claims coverage of an entry this node refused, so no peer will \
+         ever send it again"
+    );
+}
+
+/// The divergence check compares our digest against the one the responder volunteers.
+/// Putting our digest in the *request* therefore tells the responder the exact value it
+/// needs to appear healthy: echo it, and `digest_match` is `Some(true)` every round, so
+/// the counter that drives repair is reset before it can ever reach the threshold.
+///
+/// A responder has no use for it — `handle_envelope` never reads the field — so the
+/// only thing sending it can do is disclose.
+#[tokio::test]
+async fn a_sync_request_does_not_disclose_our_own_digest() {
+    let a = Node::new(1, vec![2]);
+    a.write().put("k".to_string(), b"v".to_vec()).unwrap();
+
+    let request = a.read().prepare_sync(2, uuid_for(1));
+    assert!(
+        request.digest.is_none(),
+        "a request carrying our digest lets any responder forge agreement with it"
+    );
+
+    // The responder still volunteers its own, which is what detection actually reads.
+    let b = PeerEndpoint::new(2, vec![1]);
+    let response = b.handle_envelope(request).unwrap();
+    assert!(
+        response.digest.is_some(),
+        "removing it from requests must not disarm the check itself"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Opportunistic push
 // ---------------------------------------------------------------------------

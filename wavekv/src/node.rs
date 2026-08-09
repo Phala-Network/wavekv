@@ -57,6 +57,9 @@ pub struct MergeOutcome {
     pub resume_from: Option<(NodeId, u64)>,
     /// Whether acks were adopted this round (false if R1/R2/R3 blocked it).
     pub acks_adopted: bool,
+    /// Whether *this envelope's* batch merged without a refusal. A paginated round must
+    /// carry this across pages: R1 is a property of the whole delta, not of one page.
+    pub complete: bool,
 }
 
 /// Core mutable state - all protected by a single RwLock for consistency
@@ -437,7 +440,11 @@ impl NodeState {
         env.acks = self.core.acks().clone();
         env.entries = delta.entries;
         env.page = delta.page;
-        env.digest = Some(self.state_digest());
+        // Deliberately no digest. The responder never reads one off a request, so
+        // sending it buys nothing and hands any responder the answer: echo it back and
+        // `digest_match` is `Some(true)` every round, pinning the divergence counter at
+        // zero for as long as it likes. Comparison happens on the initiator, against the
+        // digest the *responder* volunteers.
         env
     }
 
@@ -515,8 +522,24 @@ impl NodeState {
         Ok(response)
     }
 
-    /// Consume a response envelope (initiator side).
+    /// Consume a response envelope (initiator side) that is not part of a paginated
+    /// round, or is its first page.
     pub fn apply_envelope(&mut self, env: SyncEnvelope) -> Result<MergeOutcome> {
+        self.apply_envelope_in_round(env, true)
+    }
+
+    /// Consume a later page of a paginated round.
+    ///
+    /// `earlier_pages_complete` is false once any earlier page of the same round had an
+    /// entry refused. Without it, R1 is evaluated per envelope: a refusal on page one
+    /// followed by a clean final page adopts the peer's whole ack map, claiming coverage
+    /// of the entry that was refused. Unpaged, that refusal correctly parks the acks and
+    /// the entry comes back next round.
+    pub fn apply_envelope_in_round(
+        &mut self,
+        env: SyncEnvelope,
+        earlier_pages_complete: bool,
+    ) -> Result<MergeOutcome> {
         let peer = env.sender_id;
         let peer_acks = env.acks.clone();
         let adoption_allowed = env.permits_ack_adoption();
@@ -529,7 +552,7 @@ impl NodeState {
 
         let (merged, rejected, complete) = self.merge_batch(env.entries);
 
-        let acks_adopted = complete && adoption_allowed;
+        let acks_adopted = complete && earlier_pages_complete && adoption_allowed;
         if acks_adopted {
             self.core.adopt_acks(&peer_acks);
         }
@@ -544,6 +567,7 @@ impl NodeState {
             digest_match,
             resume_from,
             acks_adopted,
+            complete,
         })
     }
 

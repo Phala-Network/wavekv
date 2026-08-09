@@ -586,6 +586,9 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
         });
 
         let outcome = self.store.write().apply_envelope(response)?;
+        // R1 spans the whole round: a refusal on any page must block adoption on the
+        // final one, and only the loop below can remember that.
+        let mut round_complete = outcome.complete;
 
         // Divergence detection: only meaningful once both sides have nothing to send.
         let quiescent = outcome.merged == 0 && outcome.peer_delta_empty;
@@ -635,7 +638,12 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
             else {
                 break;
             };
-            resume = self.store.write().apply_envelope(response)?.resume_from;
+            let paged = self
+                .store
+                .write()
+                .apply_envelope_in_round(response, round_complete)?;
+            round_complete &= paged.complete;
+            resume = paged.resume_from;
         }
 
         Ok(true)
