@@ -241,6 +241,68 @@ fn a_cluster_of_two_v1_and_one_v2_converges() {
     assert_eq!(b.digest(), v2_digest(&c));
 }
 
+/// A v1 hop does **not** relay, so a mixed cluster has to stay fully meshed.
+///
+/// RFC 8.2.1 asserts that "v1 nodes buffer v2-origin entries in per-origin logs and
+/// relay to other v1 peers". They do not. `apply_pulled_entries` writes what it pulled
+/// into the data map only, never into the per-origin logs that the incremental server
+/// path reads, and that is origin-agnostic — it is how v1 has always behaved, not
+/// something the migration introduced. A v1 node therefore answers a peer that already
+/// has coverage with an empty incremental response, forever.
+///
+/// The consequence is a topology constraint rather than a bug: convergence needs a
+/// direct edge between any two nodes that must exchange data. Both halves are asserted
+/// below, because the second is what makes the first a constraint instead of a defect.
+#[test]
+fn a_v1_hop_does_not_relay_so_the_cluster_must_stay_meshed() {
+    // Chain: v2(1) — v1(2) — v2(3). The ends are peers of the hop but not of each other.
+    let a = V2Node::new(1, vec![2]);
+    let b = V1Peer::new(2, vec![1, 3]);
+    let c = V2Node::new(3, vec![2]);
+
+    a.write()
+        .put("from-a".to_string(), b"1".to_vec())
+        .expect("v2 put");
+    c.write()
+        .put("from-c".to_string(), b"3".to_vec())
+        .expect("v2 put");
+
+    for _ in 0..4 {
+        round_v1_to_v2(&b, &a);
+        round_v1_to_v2(&b, &c);
+        round_v2_to_v1(&a, &b);
+        round_v2_to_v1(&c, &b);
+    }
+
+    // The hop itself converges: it holds both writes.
+    assert!(b.get("from-a").is_some() && b.get("from-c").is_some());
+
+    // ...and passes on neither, because neither entry was ever logged under its origin.
+    assert!(
+        c.read().get("from-a").is_none(),
+        "a v1 hop that relayed would make this pass, and RFC 8.2.1 says it should"
+    );
+    assert!(a.read().get("from-c").is_none());
+    assert_ne!(v2_digest(&a), v2_digest(&c));
+
+    // Give the ends a direct edge and they converge immediately. This is what the
+    // cluster actually relies on, and what auto-discovery establishes in practice.
+    a.write().add_peer(3).expect("add peer");
+    c.write().add_peer(1).expect("add peer");
+    round_v2_to_v2(&a, &c);
+    round_v2_to_v2(&c, &a);
+
+    assert_eq!(
+        c.read().get("from-a").and_then(|e| e.value),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(
+        a.read().get("from-c").and_then(|e| e.value),
+        Some(b"3".to_vec())
+    );
+    assert_eq!(v2_digest(&a), v2_digest(&c));
+}
+
 #[test]
 fn a_cluster_of_one_v1_and_two_v2_converges() {
     let a = V1Peer::new(1, vec![2, 3]);
