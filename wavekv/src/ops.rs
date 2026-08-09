@@ -61,12 +61,25 @@ pub enum StateOp {
 }
 
 impl StateOp {
-    /// Whether v2 persists this op. v2's WAL is `Set`/`Clear` only: ack bookkeeping is
-    /// volatile (a lost ack costs one larger delta, nothing more) and `next_seq` is
-    /// recovered from the replayed entries themselves — see the `Set` arm of
-    /// [`CoreState::execute`], which is what makes that second claim true.
+    /// Whether v2 persists this op.
+    ///
+    /// Data (`Set`/`Clear`) and membership (`AddPeer`/`RemovePeer`). Ack bookkeeping is
+    /// deliberately volatile — a lost ack costs one larger delta, nothing more — and
+    /// `next_seq` is recovered from the replayed entries themselves, which the `Set` arm
+    /// of [`CoreState::execute`] is what makes true.
+    ///
+    /// Membership is durable because the tombstone GC watermark is a minimum over known
+    /// peers, and a minimum over a smaller set is larger. A peer forgotten in a crash
+    /// would let this node collect tombstones that peer never covered, and the peer's
+    /// next round would then resurrect every key it still held as a live value.
     pub fn is_durable(&self) -> bool {
-        matches!(self, StateOp::Set(_) | StateOp::Clear(_))
+        matches!(
+            self,
+            StateOp::Set(_)
+                | StateOp::Clear(_)
+                | StateOp::AddPeer { .. }
+                | StateOp::RemovePeer { .. }
+        )
     }
 }
 
@@ -230,7 +243,13 @@ impl CoreState {
             }
             StateOp::RemovePeer { peer_id } => {
                 self.members.retain(|&id| id != peer_id);
-                self.acks.remove(&peer_id);
+                // `peer_acks[peer_id]` is our cached view of a node we no longer talk
+                // to: dead weight, drop it. `acks[peer_id]` is our coverage of the
+                // entries that node *authored*, which stay in the data map and in every
+                // digest after it leaves. It is also what we report to everyone else,
+                // and the tombstone GC watermark is a minimum over exactly those
+                // reports — so dropping it makes the watermark for that origin
+                // unknowable cluster-wide and strands its tombstones permanently.
                 self.peer_acks.remove(&peer_id);
             }
             StateOp::IncrementSeq => {

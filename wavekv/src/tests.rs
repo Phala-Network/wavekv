@@ -2111,3 +2111,57 @@ async fn a_reused_node_id_is_rejected_on_every_entry_point() {
     genuine_push.push_only = true;
     assert!(sync.handle_push(genuine_push).is_ok());
 }
+
+/// Retiring a peer must not erase what we know about the entries it authored.
+///
+/// The tombstone GC watermark asks, for each origin, the minimum coverage every peer
+/// reports for it. `RemovePeer` also dropped `acks[removed]`, and that map is exactly
+/// what we report to everyone else. Once a node was retired cluster-wide, no ack map
+/// mentioned that origin any more, so the watermark for it became unknowable and every
+/// tombstone it ever authored stayed in the data map — and in the digest — for good.
+///
+/// Membership is about who we still exchange rounds with. An origin's entries, and our
+/// coverage of them, outlive the node that wrote them.
+#[tokio::test]
+async fn retiring_a_peer_keeps_our_coverage_of_the_entries_it_authored() {
+    use crate::sync::SyncEnvelope;
+
+    let n = Node::new(1, vec![2, 3]);
+    let mut from_2 = SyncEnvelope::new(2, uuid_for(2));
+    from_2.acks.insert(2, 5);
+    n.write().handle_envelope(from_2, uuid_for(1)).unwrap();
+    assert_eq!(n.read().acks_snapshot().get(&2).copied(), Some(5));
+
+    n.write().remove_peer(2).unwrap();
+
+    assert_eq!(
+        n.read().prepare_sync(3, uuid_for(1)).acks.get(&2).copied(),
+        Some(5),
+        "dropping this leaves every peer unable to compute a GC watermark for origin 2, \
+         so its tombstones are uncollectable forever"
+    );
+}
+
+/// Membership must survive a crash, because the tombstone GC watermark is a minimum
+/// over *known* peers — and a minimum over a smaller set is larger.
+///
+/// A peer added but not yet captured in a snapshot used to vanish on restart. The node
+/// would then compute the watermark without it and collect tombstones that peer had
+/// never covered, so the peer's next round would resurrect every key it still held as a
+/// live value. Deletion is the one operation this store cannot afford to lose.
+#[tokio::test]
+async fn a_peer_added_before_a_crash_is_still_a_peer_after_it() {
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let store = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+    store.write().add_peer(3).unwrap();
+    // Crash: no snapshot, only whatever reached the WAL.
+    drop(store);
+
+    let recovered = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+    assert!(
+        recovered.read().get_peers().contains(&3),
+        "losing a peer silently widens the GC watermark and resurrects its deletes"
+    );
+}

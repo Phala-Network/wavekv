@@ -811,7 +811,18 @@ impl NodeState {
     /// WireGuard config.
     ///
     /// Caveat (accepted, documented): the watermark spans *known* peers, so a
-    /// permanently retired peer pins GC until `remove_peer` is called for it.
+    /// permanently retired peer pins GC until `remove_peer` is called for it. Note that
+    /// `remove_peer` deliberately keeps `acks[removed]` — that is our coverage of the
+    /// entries the departed node authored, which outlive it, and it is what lets the
+    /// rest of the cluster still compute a watermark for that origin.
+    ///
+    /// Second caveat: GC cadence is uncoordinated and the digest covers tombstones, so
+    /// two honest, fully converged peers that collect at different times will report
+    /// unequal digests until the laggard catches up. That is a false divergence signal.
+    /// It is bounded — the repair in RFC 3.6 only lowers acks, which costs a
+    /// retransmission and cannot lose data — but a cluster that collects on a wildly
+    /// uneven cadence will see spurious repairs. Aligning the cadence, or excluding
+    /// tombstones from the digest, is future work.
     pub fn collect_tombstone_garbage(&mut self) -> Result<usize> {
         let peers = self.get_peers();
         if peers.is_empty() {
