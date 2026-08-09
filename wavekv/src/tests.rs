@@ -547,19 +547,38 @@ impl crate::sync::ExchangeInterface for DirectLink {
     async fn sync_to(
         &self,
         _node: &Node,
-        _peer: u32,
+        peer: u32,
         msg: crate::sync::SyncMessage,
     ) -> anyhow::Result<crate::sync::SyncResponse> {
+        self.check_addressed_to(peer)?;
         self.target.handle_sync_v1(msg)
     }
 
     async fn sync_v2_to(
         &self,
         _node: &Node,
-        _peer: u32,
+        peer: u32,
         env: crate::sync::SyncEnvelope,
     ) -> anyhow::Result<Option<crate::sync::SyncEnvelope>> {
+        self.check_addressed_to(peer)?;
         Ok(Some(self.target.handle_envelope(env)?))
+    }
+}
+
+impl DirectLink {
+    /// A real transport dials the peer it is given. This double holds exactly one, so a
+    /// fixture whose member list names a peer it never wired up would otherwise have
+    /// every such round answered by the wrong node — and a per-peer mechanism could
+    /// then be "confirmed" by a link that does not exist. That is not hypothetical: a
+    /// third-origin divergence fixture converged here through a phantom peer before
+    /// this check existed.
+    fn check_addressed_to(&self, peer: NodeId) -> anyhow::Result<()> {
+        let target = self.target.node().read().id;
+        anyhow::ensure!(
+            peer == target,
+            "fixture routed a round for peer {peer} to node {target};              wire the peer up or drop it from the member list"
+        );
+        Ok(())
     }
 }
 
@@ -1297,6 +1316,68 @@ async fn persistently_mismatched_digests_trigger_an_automatic_repair() {
         Some(0),
         "the counter resets once the pair agrees again"
     );
+}
+
+/// The two-node fixture above cannot distinguish "repairs the pair" from "repairs the
+/// entries the peer itself authored", because there every entry is origin==peer.
+///
+/// Lowering `acks[peer]` only asks the peer to resend what *it* wrote. A third node's
+/// entries are filtered by `acks[C]`, which the repair never touches — so the responder
+/// stays silent about exactly the data that is missing, round after round.
+#[tokio::test]
+async fn repair_recovers_an_entry_authored_by_a_third_node() {
+    use crate::sync::{SyncConfig, SyncEnvelope};
+
+    // Only B is a member: `DirectLink` answers for whatever peer it is handed, so a
+    // third member would give the repair a second, uncontrolled link to converge on.
+    let a = Node::new(1, vec![2]);
+    let b = PeerEndpoint::new(2, vec![1]);
+
+    // C's entry reaches B by an ordinary sync with C.
+    let from_c = |entries: Vec<Entry>| {
+        let mut env = SyncEnvelope::new(3, uuid_for(3));
+        env.acks.insert(3, 1);
+        env.entries = entries;
+        env
+    };
+    let c_entry = Entry::new_put(Metadata::new(3, 1, 1000), "only-on-b".into(), b"c".to_vec());
+    b.node()
+        .write()
+        .handle_envelope(from_c(vec![c_entry]), uuid_for(2))
+        .unwrap();
+
+    // A adopts C's coverage without ever receiving the entry — the divergence.
+    a.write()
+        .handle_envelope(from_c(Vec::new()), uuid_for(1))
+        .unwrap();
+
+    assert_ne!(
+        a.state_digest(),
+        b.node().state_digest(),
+        "A is missing a C-authored entry it claims to cover"
+    );
+
+    let sync = SyncManager::with_config(
+        a.clone(),
+        DirectLink {
+            me: 1,
+            target: b.clone(),
+        },
+        SyncConfig {
+            digest_check_rounds: 2,
+            ..Default::default()
+        },
+    );
+
+    for _ in 0..6 {
+        sync.bootstrap().await.unwrap();
+    }
+
+    assert!(
+        a.read().get("only-on-b").is_some(),
+        "the repair must recover entries of every origin, not just the peer's own"
+    );
+    assert_eq!(a.state_digest(), b.node().state_digest());
 }
 
 // ---------------------------------------------------------------------------

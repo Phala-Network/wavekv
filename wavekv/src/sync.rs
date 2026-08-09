@@ -235,6 +235,11 @@ struct PeerLink {
     /// change `protocol` (only a definitive 404/405 does), so without this counter a
     /// peer that fails every single round is indistinguishable from a healthy one.
     consecutive_failures: u32,
+    /// Set when divergence is declared; consumed by the next request, which asks the
+    /// responder to ignore our acks entirely (RFC 3.6). Lowering our own `acks[peer]`
+    /// only reclaims entries the peer authored — a third origin's entries stay filtered
+    /// by an `acks[C]` the repair never touches.
+    reset_acks_pending: bool,
 }
 
 impl Default for PeerLink {
@@ -245,6 +250,7 @@ impl Default for PeerLink {
             probed_at: None,
             digest_mismatches: 0,
             consecutive_failures: 0,
+            reset_acks_pending: false,
         }
     }
 }
@@ -554,10 +560,17 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
         let uuid = self.app.uuid();
 
         // R4: entries, acks and digest all come from one guard.
-        let request = {
+        let mut request = {
             let state = self.store.read();
             state.prepare_sync(peer, uuid)
         };
+        // Repair armed by a previous round: ask the responder to serve a full delta
+        // rather than one filtered by acks we have just shown to be untrustworthy.
+        let mut reset_armed = false;
+        self.update_link(peer, |link| {
+            reset_armed = std::mem::take(&mut link.reset_acks_pending);
+        });
+        request.reset_acks = reset_armed;
         let request_acks = request.acks.clone();
 
         let result = tokio::time::timeout(timeout, self.app.sync_v2_to(&self.store, peer, request))
@@ -594,7 +607,10 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
                         // Safe by construction: the data map is never truncated, so
                         // lowering acks can only cause retransmission.
                         self.store.write().reset_peer_coverage(peer);
-                        self.update_link(peer, |link| link.digest_mismatches = 0);
+                        self.update_link(peer, |link| {
+                            link.digest_mismatches = 0;
+                            link.reset_acks_pending = true;
+                        });
                     }
                 }
                 None => {}
