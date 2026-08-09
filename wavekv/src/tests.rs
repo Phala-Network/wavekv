@@ -1770,6 +1770,94 @@ async fn recovery_resumes_after_the_highest_used_seq() {
     );
 }
 
+/// The same hazard, from the direction the fixture above cannot reach: `max_own_seq`
+/// scans the *live* index, and a peer's LWW win evicts our `(id, seq)` from it. The
+/// seq stays covered by every peer's ack map regardless — coverage is about what was
+/// authored, not about what still wins — so rebuilding `next_seq` from live entries
+/// alone hands the number straight back out.
+#[tokio::test]
+async fn recovery_does_not_reuse_a_seq_whose_entry_lost_lww() {
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let store = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+    let mine = store
+        .write()
+        .put("k".to_string(), b"mine".to_vec())
+        .unwrap();
+    assert_eq!(mine.meta.seq, 1);
+
+    // Node 2 wins the key. Our own entry is evicted from the live index; our ack for
+    // ourselves still records that seq 1 was authored.
+    store
+        .write()
+        .sync(Entry::new_put(
+            Metadata::new(2, 1, mine.meta.timestamp + 1_000),
+            "k".into(),
+            b"theirs".to_vec(),
+        ))
+        .unwrap();
+    drop(store);
+
+    let recovered = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+    recovered.write().recover_next_seq();
+    let next = recovered
+        .write()
+        .put("after".to_string(), b"v".to_vec())
+        .unwrap();
+    assert!(
+        next.meta.seq > mine.meta.seq,
+        "seq {} was already handed out; peers filter it as already seen and the write \
+         is lost with no error anywhere",
+        next.meta.seq
+    );
+}
+
+/// A node whose data directory is lost keeps its id, so its old seqs are still spent —
+/// and the only surviving record of how many is the peers' coverage of it.
+///
+/// `bootstrap` syncs before rebuilding `next_seq` precisely so this is available.
+/// Without consulting our own ack the rebuilt node restarts from 1, and every write it
+/// makes until it passes its old high-water mark is filtered out by every peer as
+/// already seen — the node looks healthy and publishes nothing.
+#[tokio::test]
+async fn a_rebuilt_node_relearns_its_spent_seqs_from_its_peers() {
+    use crate::sync::SyncConfig;
+
+    let rebuilt = Node::new(1, vec![2]);
+    let peer = PeerEndpoint::new(2, vec![1]);
+
+    // The peer remembers covering node 1 up to seq 7 — told to it by the node as it was
+    // before the loss. The rebuilt node itself holds nothing.
+    let mut before_the_loss = crate::sync::SyncEnvelope::new(1, uuid_for(1));
+    before_the_loss.acks.insert(1, 7);
+    peer.node()
+        .write()
+        .handle_envelope(before_the_loss, uuid_for(2))
+        .unwrap();
+    assert!(rebuilt.read().get_all_including_tombstones().is_empty());
+
+    let sync = SyncManager::with_config(
+        rebuilt.clone(),
+        DirectLink {
+            me: 1,
+            target: peer.clone(),
+        },
+        SyncConfig::default(),
+    );
+    sync.bootstrap().await.unwrap();
+
+    let next = rebuilt
+        .write()
+        .put("after-rebuild".to_string(), b"v".to_vec())
+        .unwrap();
+    assert!(
+        next.meta.seq > 7,
+        "seq {} is still covered by the peer, which will filter the write out",
+        next.meta.seq
+    );
+}
+
 /// A peer whose uuid was regenerated must still be able to converge.
 ///
 /// The node id is configuration; the uuid is derived from local state, so a node whose

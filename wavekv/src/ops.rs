@@ -63,7 +63,8 @@ pub enum StateOp {
 impl StateOp {
     /// Whether v2 persists this op. v2's WAL is `Set`/`Clear` only: ack bookkeeping is
     /// volatile (a lost ack costs one larger delta, nothing more) and `next_seq` is
-    /// recovered from the replayed entries themselves.
+    /// recovered from the replayed entries themselves — see the `Set` arm of
+    /// [`CoreState::execute`], which is what makes that second claim true.
     pub fn is_durable(&self) -> bool {
         matches!(self, StateOp::Set(_) | StateOp::Clear(_))
     }
@@ -182,6 +183,17 @@ impl CoreState {
     pub fn execute(&mut self, op: StateOp) {
         match op {
             StateOp::Set(entry) => {
+                // A seq we authored is spent the moment it is written, and must never be
+                // handed out again. The live index cannot testify to that — a peer
+                // winning this key under LWW evicts our `(id, seq)` from it — but the
+                // WAL record replayed here can, so bump on the way past. During normal
+                // operation `alloc_entry_meta` has already advanced `next_seq`, making
+                // this a no-op; it earns its keep only on replay. Over-counting (say, an
+                // entry that claims our id but is not ours) skips a seq, which is
+                // harmless; under-counting reissues one, which is silent write loss.
+                if entry.meta.node == self.id {
+                    self.next_seq = self.next_seq.max(entry.meta.seq.saturating_add(1));
+                }
                 self.index_remove_for_key(&entry.key);
                 self.origin_index
                     .insert((entry.meta.node, entry.meta.seq), entry.key.clone());

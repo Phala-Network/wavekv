@@ -836,7 +836,13 @@ impl NodeState {
     /// Recover `next_seq` from the live index after a restart or bootstrap.
     /// One range scan, replacing v1's walk over every log bucket plus the data map.
     pub fn recover_next_seq(&mut self) {
-        let max_own = self.core.max_own_seq();
+        // `max_own_seq` scans the live index, which is not a record of what we authored:
+        // an entry we wrote is evicted when a peer wins the key under LWW, or when its
+        // tombstone is collected. Our own ack survives both — it advances on every local
+        // write and never regresses — so it is the lower bound the index cannot supply.
+        // Underestimating here reissues a seq that peers already cover, and they filter
+        // the new write out as "already seen" with no error anywhere.
+        let max_own = self.core.max_own_seq().max(self.core.ack_for(self.id));
         if max_own > 0 {
             self.core.execute(StateOp::SetNextSeq(max_own + 1));
         }
