@@ -108,9 +108,6 @@ impl Limits {
 pub struct NodeConfig {
     pub limits: Limits,
     pub admission: Option<Arc<dyn AdmissionPolicy>>,
-    /// Consecutive rounds with empty deltas but unequal digests before the node
-    /// declares divergence and forces a full re-exchange.
-    pub digest_check_rounds: u32,
     /// Coalescing window for opportunistic push. `None` disables push entirely.
     /// Coalescing window for opportunistic push.
     ///
@@ -128,7 +125,6 @@ impl Default for NodeConfig {
         Self {
             limits: Limits::default(),
             admission: None,
-            digest_check_rounds: 3,
             coalesce_window: Some(Duration::from_millis(200)),
             max_delta_entries: 4096,
             max_delta_bytes: 4 * 1024 * 1024,
@@ -141,7 +137,6 @@ impl std::fmt::Debug for NodeConfig {
         f.debug_struct("NodeConfig")
             .field("limits", &self.limits)
             .field("admission", &self.admission.is_some())
-            .field("digest_check_rounds", &self.digest_check_rounds)
             .field("coalesce_window", &self.coalesce_window)
             .field("max_delta_entries", &self.max_delta_entries)
             .field("max_delta_bytes", &self.max_delta_bytes)

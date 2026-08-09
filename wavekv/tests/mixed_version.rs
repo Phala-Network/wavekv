@@ -126,7 +126,7 @@ fn v2_digest(node: &V2Node) -> StateDigest {
 }
 
 // ---------------------------------------------------------------------------
-// Round drivers — one per direction in the RFC 8.2.2 behaviour matrix
+// Round drivers — one per direction in the RFC 8.2.1 behaviour matrix
 // ---------------------------------------------------------------------------
 
 /// v1 initiates against a v2 responder (the shim path).
@@ -243,8 +243,9 @@ fn a_cluster_of_two_v1_and_one_v2_converges() {
 
 /// A v1 hop does **not** relay, so a mixed cluster has to stay fully meshed.
 ///
-/// RFC 8.2.1 asserts that "v1 nodes buffer v2-origin entries in per-origin logs and
-/// relay to other v1 peers". They do not. `apply_pulled_entries` writes what it pulled
+/// An earlier draft of RFC 8.2.1 asserted that "v1 nodes buffer v2-origin entries in
+/// per-origin logs and relay to other v1 peers". They do not, and the section now says
+/// so — this test is what corrected it. `apply_pulled_entries` writes what it pulled
 /// into the data map only, never into the per-origin logs that the incremental server
 /// path reads, and that is origin-agnostic — it is how v1 has always behaved, not
 /// something the migration introduced. A v1 node therefore answers a peer that already
@@ -280,7 +281,7 @@ fn a_v1_hop_does_not_relay_so_the_cluster_must_stay_meshed() {
     // ...and passes on neither, because neither entry was ever logged under its origin.
     assert!(
         c.read().get("from-a").is_none(),
-        "a v1 hop that relayed would make this pass, and RFC 8.2.1 says it should"
+        "a v1 hop that relayed would make this pass; the RFC once claimed it would"
     );
     assert!(a.read().get("from-c").is_none());
     assert_ne!(v2_digest(&a), v2_digest(&c));
