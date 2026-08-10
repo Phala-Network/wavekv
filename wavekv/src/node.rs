@@ -88,6 +88,9 @@ pub struct NodeState {
 
     entries_merged: u64,
     entries_rejected: u64,
+    /// Set while this node is bootstrapping, which suspends adoption of a *requester's*
+    /// ack map. See [`NodeState::begin_bootstrap`].
+    bootstrap_pending: bool,
 }
 
 enum WatchPattern {
@@ -493,7 +496,15 @@ impl NodeState {
         let (_, _, complete) = self.merge_batch(env.entries);
 
         // R1 + R2: adopt only after a complete merge of a complete delta.
-        if complete && adoption_allowed {
+        //
+        // R5, while bootstrapping: a requester's delta is computed against its cached
+        // view of *our* coverage, and a node rebuilt from an empty data directory is
+        // precisely the case where that cache over-states us. The delta then arrives
+        // nearly empty, merges "completely", and adopting its acks would have us claim
+        // coverage of state we do not hold — which propagates to every peer and feeds
+        // the tombstone GC watermark. Our own rounds still adopt (see `apply_envelope`):
+        // there we sent the acks, so the delta is complete relative to the truth.
+        if complete && adoption_allowed && !self.bootstrap_pending {
             self.core.adopt_acks(&requested_acks);
         }
         self.core.record_peer_acks(peer, requested_acks.clone());
@@ -883,6 +894,18 @@ impl NodeState {
         }
     }
 
+    /// Suspend adoption of a requester's ack map until [`NodeState::finish_bootstrap`].
+    ///
+    /// Called by `SyncManager::bootstrap`. A node that never bootstraps is unaffected:
+    /// the flag starts clear, so this is opt-in and cannot silently freeze coverage.
+    pub fn begin_bootstrap(&mut self) {
+        self.bootstrap_pending = true;
+    }
+
+    pub fn finish_bootstrap(&mut self) {
+        self.bootstrap_pending = false;
+    }
+
     pub fn ensure_next_seq(&mut self, min_next_seq: u64) {
         self.core.execute(StateOp::SetNextSeq(min_next_seq));
     }
@@ -953,6 +976,7 @@ impl Node {
             pending_push: Vec::new(),
             entries_merged: 0,
             entries_rejected: 0,
+            bootstrap_pending: false,
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -995,6 +1019,7 @@ impl Node {
             pending_push: Vec::new(),
             entries_merged: 0,
             entries_rejected: 0,
+            bootstrap_pending: false,
         };
 
         if state.load_snapshot_if_exists()? {

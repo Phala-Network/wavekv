@@ -349,6 +349,7 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
     /// Critical after data loss, to avoid reusing sequence numbers.
     pub async fn bootstrap(&self) -> Result<()> {
         let peers = self.store.read().get_peers();
+        self.store.write().begin_bootstrap();
         let results = self.sync_to_all_peers().await;
         let mut success_count = 0;
         for (peer, result) in results {
@@ -364,7 +365,11 @@ impl<Net: ExchangeInterface + Clone> SyncManager<Net> {
         }
 
         // One range scan over origin_index replaces v1's walk of every log bucket.
-        self.store.write().recover_next_seq();
+        {
+            let mut state = self.store.write();
+            state.recover_next_seq();
+            state.finish_bootstrap();
+        }
 
         if success_count == 0 && !peers.is_empty() {
             warn!("bootstrap: failed to sync from any peer, proceeding anyway");

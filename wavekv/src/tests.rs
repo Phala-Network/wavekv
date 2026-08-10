@@ -2165,3 +2165,177 @@ async fn a_peer_added_before_a_crash_is_still_a_peer_after_it() {
         "losing a peer silently widens the GC watermark and resurrects its deletes"
     );
 }
+
+/// A node rebuilt from an empty data directory must not take a requester's word for
+/// what it holds.
+///
+/// The requester computes its delta against a *cached* view of our coverage. That cache
+/// is stale in the dangerous direction here — it still records the coverage we had
+/// before the rebuild — so the delta arrives nearly empty. Merging it is "complete" by
+/// every local test, and adopting the acks that came with it makes us claim coverage of
+/// state we do not hold. Those claims then propagate into every peer's `peer_acks` and
+/// feed the tombstone GC watermark, where they can retire a tombstone nobody has seen.
+#[tokio::test]
+async fn a_node_mid_bootstrap_does_not_adopt_a_requesters_coverage() {
+    use crate::sync::SyncEnvelope;
+
+    let rebuilt = Node::new(1, vec![2]);
+    rebuilt.write().begin_bootstrap();
+
+    // A peer that believes we are fully caught up sends us almost nothing.
+    let mut request = SyncEnvelope::new(2, uuid_for(2));
+    request.acks.insert(2, 99);
+    request.acks.insert(3, 99);
+    rebuilt
+        .write()
+        .handle_envelope(request, uuid_for(1))
+        .unwrap();
+
+    assert!(
+        rebuilt.read().acks_snapshot().is_empty(),
+        "claiming coverage while holding nothing is the hole-INV violation itself: {:?}",
+        rebuilt.read().acks_snapshot()
+    );
+}
+
+/// The guard is a window, not a mode: once bootstrap has run, ordinary adoption resumes.
+/// Leaving it armed would stop coverage advancing for the life of the process.
+#[tokio::test]
+async fn adoption_resumes_once_bootstrap_has_finished() {
+    use crate::sync::{SyncConfig, SyncEnvelope};
+
+    let node = Node::new(1, vec![2]);
+    let peer = PeerEndpoint::new(2, vec![1]);
+    let sync = SyncManager::with_config(
+        node.clone(),
+        DirectLink {
+            me: 1,
+            target: peer.clone(),
+        },
+        SyncConfig::default(),
+    );
+    sync.bootstrap().await.unwrap();
+
+    let mut request = SyncEnvelope::new(2, uuid_for(2));
+    request.acks.insert(2, 5);
+    node.write().handle_envelope(request, uuid_for(1)).unwrap();
+
+    assert_eq!(
+        node.read().acks_snapshot().get(&2).copied(),
+        Some(5),
+        "bootstrap must disarm the guard it armed"
+    );
+}
+
+/// Losing a snapshot generation must not hand a sequence number back out.
+///
+/// `persist_to_disk` rotates the primary snapshot to `.bak` and then resets the WAL, so
+/// if the primary later turns out to be unreadable the node falls back to `.bak` — one
+/// whole generation of its own writes older, with no WAL left to replay the difference.
+/// Rebuilding `next_seq` from that state alone under-counts.
+///
+/// The recovery is the peers': they still cover the seqs this node has forgotten, which
+/// is why `bootstrap` syncs before it rebuilds the counter. This pins that path, since
+/// it is the only thing standing between a lost generation and silent write loss.
+#[tokio::test]
+async fn a_lost_snapshot_generation_does_not_reuse_seqs_a_peer_still_covers() {
+    use crate::sync::SyncConfig;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let store = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+
+    // Generation one, captured in a snapshot.
+    store.write().put("k1".to_string(), b"v".to_vec()).unwrap();
+    store.write().persist_to_disk().unwrap();
+    // Generation two: rotates the first to .bak, then resets the WAL.
+    let latest = store.write().put("k2".to_string(), b"v".to_vec()).unwrap();
+    store.write().persist_to_disk().unwrap();
+    assert_eq!(latest.meta.seq, 2);
+    drop(store);
+
+    // The primary generation is unreadable; only .bak survives, and it predates seq 2.
+    let primary = dir.path().join("node_1.snapshot");
+    fs_err::write(&primary, b"not a snapshot").unwrap();
+
+    let recovered = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+    assert!(
+        recovered.read().get("k2").is_none(),
+        "the fixture depends on the newer generation actually being lost"
+    );
+
+    // The peer still remembers covering us up to seq 2.
+    let peer = PeerEndpoint::new(2, vec![1]);
+    let mut ours_before_the_loss = crate::sync::SyncEnvelope::new(1, uuid_for(1));
+    ours_before_the_loss.acks.insert(1, 2);
+    peer.node()
+        .write()
+        .handle_envelope(ours_before_the_loss, uuid_for(2))
+        .unwrap();
+
+    let sync = SyncManager::with_config(
+        recovered.clone(),
+        DirectLink {
+            me: 1,
+            target: peer.clone(),
+        },
+        SyncConfig::default(),
+    );
+    sync.bootstrap().await.unwrap();
+
+    let next = recovered
+        .write()
+        .put("after".to_string(), b"v".to_vec())
+        .unwrap();
+    assert!(
+        next.meta.seq > 2,
+        "seq {} is still covered by the peer, which will filter the write out",
+        next.meta.seq
+    );
+}
+
+/// The third way an own write leaves the live index: its tombstone gets collected.
+///
+/// Coverage of that seq survives at every peer, so the counter must not step back over
+/// it. Two independent things prevent that, and neither was pinned: the snapshot carries
+/// `next_seq` explicitly, and it also carries our own ack, which `recover_next_seq`
+/// takes the maximum with. Removing either alone leaves this green; removing both turns
+/// it red, which is what says the test constrains something rather than nothing.
+#[tokio::test]
+async fn recovery_does_not_reuse_a_seq_whose_tombstone_was_collected() {
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let store = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+    store
+        .write()
+        .put("gone".to_string(), b"v".to_vec())
+        .unwrap();
+    store.write().delete("gone".to_string()).unwrap();
+    let tombstone_seq = store
+        .read()
+        .get_all_including_tombstones()
+        .get("gone")
+        .expect("tombstone")
+        .meta
+        .seq;
+    assert_eq!(tombstone_seq, 2);
+
+    // No peers, so the watermark is trivially satisfied and the tombstone is collected.
+    assert_eq!(store.write().collect_tombstone_garbage().unwrap(), 1);
+    assert!(store.read().get_all_including_tombstones().is_empty());
+    store.write().persist_to_disk().unwrap();
+    drop(store);
+
+    let recovered = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+    recovered.write().recover_next_seq();
+    let next = recovered
+        .write()
+        .put("after".to_string(), b"v".to_vec())
+        .unwrap();
+    assert!(
+        next.meta.seq > 2,
+        "seq {} was spent by a write whose tombstone has since been collected",
+        next.meta.seq
+    );
+}
