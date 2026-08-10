@@ -2125,33 +2125,38 @@ async fn a_reused_node_id_is_rejected_on_every_entry_point() {
     assert!(sync.handle_push(genuine_push).is_ok());
 }
 
-/// Retiring a peer must not erase what we know about the entries it authored.
+/// `remove_peer` must survive a restart, which constrains what else it may keep.
 ///
-/// The tombstone GC watermark asks, for each origin, the minimum coverage every peer
-/// reports for it. `RemovePeer` also dropped `acks[removed]`, and that map is exactly
-/// what we report to everyone else. Once a node was retired cluster-wide, no ack map
-/// mentioned that origin any more, so the watermark for it became unknowable and every
-/// tombstone it ever authored stayed in the data map — and in the digest — for good.
-///
-/// Membership is about who we still exchange rounds with. An origin's entries, and our
-/// coverage of them, outlive the node that wrote them.
+/// The snapshot container is byte-identical to v1 (RFC 8.3) and carries one `peers` map
+/// that does double duty: membership, and the origins we hold coverage for. The
+/// serializer folds every acked origin into it and the deserializer turns every key back
+/// into a member. So an ack kept past the membership resurrects the peer on the next
+/// load — which is why `RemovePeer` drops the ack even though that strands the
+/// tombstones the departed node authored. This pins the direction of that trade, since
+/// it is not visible from either side alone.
 #[tokio::test]
-async fn retiring_a_peer_keeps_our_coverage_of_the_entries_it_authored() {
-    use crate::sync::SyncEnvelope;
+async fn retiring_a_peer_survives_a_restart() {
+    use tempfile::TempDir;
 
-    let n = Node::new(1, vec![2, 3]);
-    let mut from_2 = SyncEnvelope::new(2, uuid_for(2));
-    from_2.acks.insert(2, 5);
-    n.write().handle_envelope(from_2, uuid_for(1)).unwrap();
-    assert_eq!(n.read().acks_snapshot().get(&2).copied(), Some(5));
+    let dir = TempDir::new().unwrap();
+    let store = Node::new_with_persistence(1, vec![2, 3], dir.path()).unwrap();
 
-    n.write().remove_peer(2).unwrap();
+    // Give origin 2 real coverage, as any live cluster would.
+    let mut from_2 = crate::sync::SyncEnvelope::new(2, uuid_for(2));
+    from_2.acks.insert(2, 4);
+    store.write().handle_envelope(from_2, uuid_for(1)).unwrap();
 
+    store.write().remove_peer(2).unwrap();
+    assert_eq!(store.read().get_peers(), vec![3]);
+    store.write().persist_to_disk().unwrap();
+    drop(store);
+
+    let reloaded = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
     assert_eq!(
-        n.read().prepare_sync(3, uuid_for(1)).acks.get(&2).copied(),
-        Some(5),
-        "dropping this leaves every peer unable to compute a GC watermark for origin 2, \
-         so its tombstones are uncollectable forever"
+        reloaded.read().get_peers(),
+        vec![3],
+        "a retired peer that comes back on restart makes remove_peer advisory, and \
+         pins the GC watermark on a node that is gone"
     );
 }
 

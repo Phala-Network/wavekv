@@ -822,10 +822,13 @@ impl NodeState {
     /// WireGuard config.
     ///
     /// Caveat (accepted, documented): the watermark spans *known* peers, so a
-    /// permanently retired peer pins GC until `remove_peer` is called for it. Note that
-    /// `remove_peer` deliberately keeps `acks[removed]` — that is our coverage of the
-    /// entries the departed node authored, which outlive it, and it is what lets the
-    /// rest of the cluster still compute a watermark for that origin.
+    /// permanently retired peer pins GC until `remove_peer` is called for it — and then
+    /// the opposite bites, because `remove_peer` also drops `acks[removed]`. Once every
+    /// node has retired a peer, no ack map mentions that origin, the watermark for it is
+    /// unknowable, and the tombstones it authored are uncollectable for good. That is
+    /// forced by the on-disk format rather than chosen; see the `RemovePeer` arm of
+    /// [`CoreState::execute`](crate::ops::CoreState::execute) for why keeping the ack is
+    /// worse.
     ///
     /// Second caveat, and it is sharper than it first looks: GC cadence is
     /// uncoordinated while the digest covers tombstones (section 3.6), so two honest,

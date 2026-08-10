@@ -243,14 +243,25 @@ impl CoreState {
             }
             StateOp::RemovePeer { peer_id } => {
                 self.members.retain(|&id| id != peer_id);
-                // `peer_acks[peer_id]` is our cached view of a node we no longer talk
-                // to: dead weight, drop it. `acks[peer_id]` is our coverage of the
-                // entries that node *authored*, which stay in the data map and in every
-                // digest after it leaves. It is also what we report to everyone else,
-                // and the tombstone GC watermark is a minimum over exactly those
-                // reports — so dropping it makes the watermark for that origin
-                // unknowable cluster-wide and strands its tombstones permanently.
                 self.peer_acks.remove(&peer_id);
+                // Dropping `acks[peer_id]` costs something real: it is our coverage of
+                // the entries that node *authored*, which stay in the data map and in
+                // every digest after it leaves, and the tombstone GC watermark is a
+                // minimum over exactly those reports. Once every node has retired the
+                // peer, no ack map mentions that origin and its tombstones can never be
+                // collected.
+                //
+                // Keeping it is worse. The snapshot container is byte-identical to v1
+                // (RFC 8.3) and has exactly one map for both facts: `peers`. The
+                // serializer folds every origin we hold an ack for into it, and the
+                // deserializer turns every key back into a *member* — so an ack that
+                // outlives the membership resurrects the peer on the next restart,
+                // silently undoing `remove_peer` and pinning GC on the dead node
+                // anyway. Within this format the two facts are indistinguishable, so
+                // the choice is which one to keep, and membership wins: it is what the
+                // caller asked for, and a leaked tombstone is a liveness cost while a
+                // resurrected peer is a wrong answer to a public API.
+                self.acks.remove(&peer_id);
             }
             StateOp::IncrementSeq => {
                 self.next_seq += 1;
