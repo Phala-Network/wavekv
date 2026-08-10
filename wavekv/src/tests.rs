@@ -1430,19 +1430,32 @@ async fn a_refusal_on_an_early_page_blocks_adoption_at_the_end_of_the_round() {
         ) -> anyhow::Result<Option<SyncEnvelope>> {
             let mut env = SyncEnvelope::new(2, uuid_for(2));
             env.acks.insert(2, 5);
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                // Page one: a single entry stamped far enough ahead to be refused.
-                env.entries = vec![Entry::new_put(
-                    Metadata::new(2, 1, epoch_millis() + 86_400_000),
-                    "refused".into(),
-                    b"v".to_vec(),
-                )];
-                env.page = Some(PageInfo {
-                    cursor: (2, 1),
-                    last: false,
-                });
+            // Three pages, not two. The refusal is on the first, and the accumulator
+            // that has to remember it is only *read* by a page after the one that
+            // follows — so a two-page round cannot tell `&=` from `|=`.
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    // Page one: a single entry stamped far enough ahead to be refused.
+                    env.entries = vec![Entry::new_put(
+                        Metadata::new(2, 1, epoch_millis() + 86_400_000),
+                        "refused".into(),
+                        b"v".to_vec(),
+                    )];
+                    env.page = Some(PageInfo {
+                        cursor: (2, 1),
+                        last: false,
+                    });
+                }
+                1 => {
+                    // Page two: clean, and not the last.
+                    env.page = Some(PageInfo {
+                        cursor: (2, 2),
+                        last: false,
+                    });
+                }
+                // Page three: clean and final (production signals "final" with `None`).
+                _ => {}
             }
-            // Any later page: clean and final (production signals "final" with `None`).
             Ok(Some(env))
         }
     }
