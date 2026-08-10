@@ -370,3 +370,128 @@ impl Drop for WriteAheadLog {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Entry, Metadata};
+
+    fn op(key: &str, seq: u64) -> StateOp {
+        StateOp::Set(Entry::new(
+            key.to_string(),
+            Some(b"v".to_vec()),
+            Metadata::new(1, seq, seq as i64),
+        ))
+    }
+
+    fn wal_with(dir: &std::path::Path, ops: &[StateOp]) -> std::path::PathBuf {
+        let path = dir.join("node_1.wal");
+        let mut wal = WriteAheadLog::new(&path, 1).expect("create wal");
+        wal.write_ops(ops).expect("write ops");
+        drop(wal);
+        path
+    }
+
+    fn keys_in(path: &std::path::Path) -> Vec<String> {
+        let wal = WriteAheadLog::new(path, 1).expect("reopen wal");
+        wal.read_all_ops()
+            .expect("replay must not fail on a damaged tail")
+            .into_iter()
+            .filter_map(|op| match op {
+                StateOp::Set(entry) => Some(entry.key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_clean_wal_replays_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1), op("b", 2), op("c", 3)]);
+        assert_eq!(keys_in(&path), vec!["a", "b", "c"]);
+    }
+
+    /// A crash mid-write leaves a partial record. WaveKV state is fully replicated, so
+    /// the right response is to drop the torn suffix and re-sync — never to refuse to
+    /// start, which would strand the node on a recoverable fault.
+    #[test]
+    fn a_torn_tail_truncates_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1), op("b", 2), op("c", 3)]);
+
+        let full_len = fs_err::metadata(&path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_len - 3).unwrap();
+        drop(file);
+
+        let keys = keys_in(&path);
+        assert_eq!(
+            keys,
+            vec!["a", "b"],
+            "the intact prefix must survive; only the torn record is dropped"
+        );
+    }
+
+    /// A corrupt length prefix must not become a multi-gigabyte allocation.
+    #[test]
+    fn an_absurd_record_length_is_bounds_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1)]);
+
+        // Append a length header claiming far more than the file can hold.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        file.write_all(b"junk").unwrap();
+        drop(file);
+
+        assert_eq!(keys_in(&path), vec!["a"]);
+    }
+
+    /// Bit rot inside a record — or a format drift that happens to decode into a
+    /// different op — is caught by the CRC over the canonical encoding.
+    #[test]
+    fn a_checksum_failure_stops_replay_without_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1), op("bbbb", 2)]);
+
+        // Flip a byte inside the last record's payload.
+        let mut bytes = fs_err::read(&path).unwrap();
+        let last = bytes.len() - 6;
+        bytes[last] ^= 0xff;
+        fs_err::write(&path, &bytes).unwrap();
+
+        let keys = keys_in(&path);
+        assert!(
+            !keys.contains(&"bbbb".to_string()),
+            "a record failing its checksum must not be replayed: {keys:?}"
+        );
+        assert_eq!(keys, vec!["a"]);
+    }
+
+    /// The relaxed handling above applies to a damaged *tail* only. A WAL belonging to
+    /// another node is a misconfiguration, not corruption, so replay refuses it outright
+    /// rather than silently adopting another node's history.
+    #[test]
+    fn a_wal_from_another_node_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1)]);
+
+        let foreign = WriteAheadLog::new(&path, 2).expect("opening only warns");
+        let err = foreign
+            .read_all_ops()
+            .expect_err("replaying node 1's WAL as node 2 must fail");
+        assert!(err.to_string().contains("node_id mismatch"), "{err}");
+    }
+
+    /// A header the current build does not understand is likewise fatal, not skippable.
+    #[test]
+    fn an_unrecognised_header_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_1.wal");
+        fs_err::write(&path, b"not a wal file at all").unwrap();
+        assert!(
+            WriteAheadLog::new(&path, 1).is_err(),
+            "a file without a valid WAL header must not be opened for appending"
+        );
+    }
+}
