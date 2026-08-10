@@ -20,9 +20,15 @@ impl StateDigest {
     /// Compute the digest over a data map in `BTreeMap` (lexicographic key) order.
     ///
     /// Tombstones are included — they are replicated state, and a replica that has
-    /// forgotten a tombstone is diverged, not merely tidy. Per-node bookkeeping
-    /// (`acks`, `peer_acks`, `next_seq`) is excluded: it legitimately differs between
-    /// converged replicas.
+    /// *lost* a tombstone will resurrect the key. Per-node bookkeeping (`acks`,
+    /// `peer_acks`, `next_seq`) is excluded: it legitimately differs between converged
+    /// replicas.
+    ///
+    /// This does put the digest in tension with tombstone GC, which is uncoordinated: a
+    /// replica that has *collected* a tombstone is tidy, not diverged, but is
+    /// indistinguishable here from one that lost it. See
+    /// [`NodeState::collect_tombstone_garbage`](crate::node::NodeState::collect_tombstone_garbage)
+    /// for what that costs and why neither obvious fix is taken.
     ///
     /// The encoding is length-prefixed at every variable-width field so that no two
     /// distinct states can produce the same byte stream (e.g. a key `"ab"` with an

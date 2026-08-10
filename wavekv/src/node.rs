@@ -827,13 +827,26 @@ impl NodeState {
     /// entries the departed node authored, which outlive it, and it is what lets the
     /// rest of the cluster still compute a watermark for that origin.
     ///
-    /// Second caveat: GC cadence is uncoordinated and the digest covers tombstones, so
-    /// two honest, fully converged peers that collect at different times will report
-    /// unequal digests until the laggard catches up. That is a false divergence signal.
-    /// It is bounded — the repair in RFC 3.6 only lowers acks, which costs a
-    /// retransmission and cannot lose data — but a cluster that collects on a wildly
-    /// uneven cadence will see spurious repairs. Aligning the cadence, or excluding
-    /// tombstones from the digest, is future work.
+    /// Second caveat, and it is sharper than it first looks: GC cadence is
+    /// uncoordinated while the digest covers tombstones (section 3.6), so two honest,
+    /// fully converged peers that collect at different times report unequal digests.
+    /// The repair then makes the laggard re-send the tombstone, the collector merges it
+    /// back, the digests agree — and the collector's next GC cycle drops it again. That
+    /// is an oscillation at GC cadence, not a one-off, and it persists for as long as
+    /// one side collects and the other does not. It is safe throughout (the repair only
+    /// lowers acks, which costs a retransmission and cannot lose data) but a cluster on
+    /// a wildly uneven cadence pays a full re-exchange each cycle.
+    ///
+    /// Neither obvious fix is taken, deliberately. Dropping tombstones from the digest
+    /// would blind it to a replica that *lost* one, which is the resurrection this
+    /// watermark exists to prevent. Excluding only collectable tombstones would make the
+    /// digest depend on `peer_acks`, which is per-node bookkeeping that legitimately
+    /// differs between converged replicas — reintroducing false divergence by the same
+    /// route. A correct fix needs the collector to remember what it collected so a
+    /// post-repair full dump does not reinstate it; that is a real design change to the
+    /// one mechanism that catches silent divergence, and is not worth making blind.
+    ///
+    /// No embedder in this repository calls this method, so the cost above is latent.
     pub fn collect_tombstone_garbage(&mut self) -> Result<usize> {
         let peers = self.get_peers();
         if peers.is_empty() {
