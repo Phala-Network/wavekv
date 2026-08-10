@@ -2339,3 +2339,145 @@ async fn recovery_does_not_reuse_a_seq_whose_tombstone_was_collected() {
         next.meta.seq
     );
 }
+
+/// `digest_check_rounds` must be a threshold, not decoration.
+///
+/// Repair is expensive — it forces a full re-exchange — and a single mismatched round
+/// is not evidence of divergence: the two sides can simply have observed each other
+/// mid-update. The existing repair tests loop until convergence, so they pass whether
+/// the threshold is three rounds or one, and mutation testing duly found `>=` could
+/// become `<` unnoticed.
+#[tokio::test]
+async fn repair_waits_for_the_configured_number_of_quiescent_rounds() {
+    use crate::sync::{SyncConfig, SyncEnvelope};
+
+    let a = Node::new(1, vec![2]);
+    let b = PeerEndpoint::new(2, vec![1]);
+    a.write()
+        .put("only-on-a".to_string(), b"1".to_vec())
+        .unwrap();
+    b.node()
+        .write()
+        .put("only-on-b".to_string(), b"2".to_vec())
+        .unwrap();
+
+    // Each side claims coverage of the other without holding its data, so both deltas
+    // are empty and every round is quiescent-but-mismatched.
+    let full_coverage = |sender: NodeId| {
+        let mut env = SyncEnvelope::new(sender, vec![]);
+        env.acks.insert(1, 1);
+        env.acks.insert(2, 1);
+        env
+    };
+    a.write().handle_envelope(full_coverage(2), vec![]).unwrap();
+    b.node()
+        .write()
+        .handle_envelope(full_coverage(1), vec![])
+        .unwrap();
+
+    let sync = SyncManager::with_config(
+        a.clone(),
+        DirectLink {
+            me: 1,
+            target: b.clone(),
+        },
+        SyncConfig {
+            digest_check_rounds: 3,
+            ..Default::default()
+        },
+    );
+
+    // Two quiescent mismatched rounds are below the threshold: no repair, and the
+    // counter is still climbing.
+    for expected in 1..3u32 {
+        sync.bootstrap().await.unwrap();
+        assert_eq!(
+            sync.link_status()
+                .iter()
+                .find(|s| s.id == 2)
+                .map(|s| s.digest_mismatches),
+            Some(expected),
+            "the counter must climb, not trigger, below the threshold"
+        );
+        assert!(
+            a.read().get("only-on-b").is_none(),
+            "repair fired after {expected} round(s); the threshold is 3"
+        );
+    }
+
+    // The third crosses it, which arms the reset; the re-exchange it asks for arrives
+    // on the following round.
+    sync.bootstrap().await.unwrap();
+    assert!(
+        a.read().get("only-on-b").is_none(),
+        "crossing the threshold arms the repair, it does not carry the data itself"
+    );
+    sync.bootstrap().await.unwrap();
+    assert!(a.read().get("only-on-b").is_some());
+}
+
+/// Divergence is only meaningful when *both* sides had nothing to send, and the two
+/// halves of that test are not interchangeable.
+///
+/// The discriminating case is a round where the peer *did* send entries but none of them
+/// changed our state — a retransmission of things we already hold. `merged == 0` is
+/// true, `peer_delta_empty` is false. Under `&&` that is not quiescence and the counter
+/// stays put; under `||` it counts, and a link that merely retransmits can drive an
+/// unnecessary full re-exchange. A fixture where both halves are false cannot tell the
+/// two apart, which is why this one arranges for exactly one to hold.
+#[tokio::test]
+async fn a_round_that_only_retransmitted_is_not_counted_as_quiescent() {
+    use crate::sync::{SyncConfig, SyncEnvelope};
+
+    let a = Node::new(1, vec![2]);
+    let b = PeerEndpoint::new(2, vec![1]);
+
+    // A holds something of its own that B will not learn about this round.
+    a.write()
+        .put("only-on-a".to_string(), b"1".to_vec())
+        .unwrap();
+    // Both hold the same B-authored entry, so B resending it changes nothing on A.
+    let shared = b
+        .node()
+        .write()
+        .put("shared".to_string(), b"v".to_vec())
+        .unwrap();
+    a.write().sync(shared).unwrap();
+
+    // Tell A that B already covers A's own origin, so A's request carries no entries
+    // for it and the two stay diverged for the round.
+    let mut b_claims_our_origin = SyncEnvelope::new(2, vec![]);
+    b_claims_our_origin.acks.insert(1, 1);
+    a.write()
+        .handle_envelope(b_claims_our_origin, vec![])
+        .unwrap();
+
+    let sync = SyncManager::with_config(
+        a.clone(),
+        DirectLink {
+            me: 1,
+            target: b.clone(),
+        },
+        SyncConfig {
+            // Above 1 deliberately: at 1 the repair fires the moment the counter moves
+            // and resets it, so the counter cannot witness whether it moved at all.
+            digest_check_rounds: 3,
+            ..Default::default()
+        },
+    );
+    sync.bootstrap().await.unwrap();
+
+    assert_ne!(
+        a.state_digest(),
+        b.node().state_digest(),
+        "the fixture depends on the round ending diverged"
+    );
+    assert_eq!(
+        sync.link_status()
+            .iter()
+            .find(|s| s.id == 2)
+            .map(|s| s.digest_mismatches),
+        Some(0),
+        "the peer retransmitted an entry we already held; that is not a quiescent round"
+    );
+}
