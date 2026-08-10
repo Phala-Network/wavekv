@@ -505,6 +505,12 @@ fn a_node_written_by_v2_can_be_rolled_back_to_the_v1_binary() {
             .put("after-snapshot".into(), b"z".to_vec())
             .unwrap();
         v2.write().delete("k0".into()).unwrap();
+        // Membership changes are WAL-durable in v2, so the rolled-back binary has to
+        // decode ops the v1 writer never emitted after a snapshot. `StateOp`'s variant
+        // order is shared, but that is exactly the kind of thing that holds by
+        // inspection right up until it does not.
+        v2.write().add_peer(9).unwrap();
+        v2.write().remove_peer(8).unwrap();
         v2_digest(&v2)
     };
 
@@ -520,6 +526,14 @@ fn a_node_written_by_v2_can_be_rolled_back_to_the_v1_binary() {
     assert!(
         v1.get("k0").is_none(),
         "the tombstone must survive rollback"
+    );
+
+    let mut members = v1.node.read().get_peers();
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        vec![9],
+        "v1 must replay the membership ops v2 wrote to the shared WAL"
     );
 
     // And it must keep allocating fresh sequence numbers rather than reusing them.
