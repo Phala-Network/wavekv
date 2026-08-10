@@ -614,7 +614,7 @@ impl NodeState {
     pub fn get_log_snapshot(&self) -> Vec<Entry> {
         let mut all_entries = Vec::new();
 
-        for (_node_id, peer_state) in self.core.peers().iter() {
+        for peer_state in self.core.peers().values() {
             let entries = &peer_state.log;
             all_entries.extend(entries.iter().cloned());
         }
