@@ -1,6 +1,6 @@
 # RFC 0001: Delta-State Synchronization (WaveKV v2)
 
-- **Status**: Draft
+- **Status**: Implemented (wavekv 2.0)
 - **Author(s)**: Kevin Wang
 - **Created**: 2026-08-07
 - **Target version**: wavekv 2.0
@@ -213,8 +213,23 @@ included.
 Notes:
 
 - The request's `entries` are computed against a possibly stale `peer_acks_A[B]`
-  cache; that only makes the delta larger, never incomplete relative to the
-  claimed `acks_A` (see R4).
+  cache. While a peer's coverage only ever grows, the cache can only lag, which
+  makes the delta larger and never incomplete relative to the claimed `acks_A`
+  (see R4).
+- That premise fails for a peer whose coverage *regresses* — a node rebuilt from
+  an empty data directory, which the inbound-only uuid check in Section 8.2.1
+  exists to support. Then the cache is an over-estimate: A sends a nearly empty delta, and B, merging it cleanly,
+  adopts `acks_A` wholesale and claims coverage of state it does not hold. B's
+  claim then propagates into every node's `peer_acks` and is a valid input to the
+  tombstone GC watermark, so under the wrong ordering a deleted key can come
+  back. A node therefore suspends adoption of a *requester's* ack map for the
+  duration of its bootstrap (`begin_bootstrap`/`finish_bootstrap`), which is
+  exactly the window in which its own coverage is unknown to it. Adoption from
+  its *own* rounds continues throughout: there it sent the acks the delta was
+  computed against, so the delta is complete relative to the truth. Outside that
+  window the premise holds again, because coverage only regresses across a
+  restart. An embedder that rebuilds a node should still prefer a fresh node id,
+  which makes the regression impossible rather than merely bounded.
 - UUID-based node-id-reuse detection is carried over unchanged from v1.
 - WaveKV remains transport-agnostic: the application delivers envelopes however
   it likes. Transport-level concerns (authentication, compression, request size
@@ -276,7 +291,7 @@ The LWW comparison `(timestamp, node, seq)` is unchanged in v2 (wire
 compatibility, Section 8). Two behavioral hardenings are added, both
 encoding-compatible:
 
-- **Future-drift clamping.** `merge` rejects (or, configurably, clamps) entries
+- **Future-drift rejection.** `merge` rejects entries
   whose `meta.timestamp` exceeds local wall time by more than
   `max_clock_drift` (default: 5 minutes). This bounds the blast radius of a
   node with a runaway clock, which under raw LWW can poison keys unfixably
@@ -307,14 +322,30 @@ to the same winning entry.
 
 Usage:
 
-- Each envelope carries the sender's digest. Equal digests after a round with
-  an empty bidirectional delta confirm convergence at O(1) network cost.
+- Each *response* carries the responder's digest, and the initiator compares it
+  against its own. Equal digests after a round with an empty bidirectional delta
+  confirm convergence at O(1) network cost.
+- Requests deliberately do not carry a digest. A responder has no use for one,
+  and sending it would hand every responder the exact value it needs to look
+  healthy: echo it back and `digest_match` is `Some(true)` every round, holding
+  the divergence counter at zero indefinitely. A peer that stays silent about
+  its digest still cannot be checked — detection needs the peer to volunteer
+  something — but it can no longer forge agreement, and a peer that volunteers a
+  wrong one only triggers a repair, which is safe by construction.
 - Persistently unequal digests across `digest_check_rounds` consecutive rounds
   with empty deltas indicate silent divergence (the class of bug v1 cannot
   see). The response is automatic: log at error level, bump a counter the
   embedder can alarm on, and reset `peer_acks[peer]` and request the peer reset
   theirs (a `reset_acks` hint flag in the envelope), forcing a full-delta
   exchange that converges the pair.
+- Both halves are load-bearing, and for different origins. Clearing
+  `peer_acks[peer]` makes *our* next delta a full dump, repairing anything the
+  peer is missing. But the peer's reply is filtered by the acks we send, and we
+  can only lower `acks[peer]` — our claims about a third node C's entries are
+  not in doubt from our side and stay untouched. Without the `reset_acks` hint
+  the peer therefore keeps filtering out precisely the C-authored entries we are
+  missing, and the pair diverges permanently while re-dumping in one direction
+  every `digest_check_rounds`.
 - The digest is exposed via `Node::state_digest()` so embedders can compare it
   across a cluster out-of-band (metrics, admin endpoints) — this also gives v1
   clusters a divergence check before the v2 migration (Section 8.4, Phase 0).
@@ -331,9 +362,22 @@ A new node (empty ack map) receives `delta(data, {})` — the entire live state,
 tombstones included. To bound message sizes, a responder paginates deltas
 larger than `max_delta_entries` / `max_delta_bytes` by `(origin, seq)` order
 with a resume cursor (`PageInfo`). Per R2, the requester adopts acks only from
-the final page. An interrupted pagination is harmless: nothing was adopted, the
-merged prefix is idempotent, and the next round restarts the filter (which now
-excludes whatever the prefix already covered — pages are not wasted).
+the final page. An interrupted pagination is harmless but not free: nothing was
+adopted, and the merged prefix is idempotent, so correctness holds — but because
+R2 blocks adoption, the requester's filter is unchanged and the next round
+resends the same pages. The work is repeated, not resumed. Making a partial
+prefix advance the filter would require admitting coverage of a delta that was
+never completed, which is exactly what R1 forbids.
+
+Pagination applies to the *responder's* delta only. A request whose own delta
+exceeds the budget is truncated, and because R2 forbids the responder from
+adopting acks off a non-final page, the requester's next round rebuilds and
+resends the same first page. The resume cursor resumes the responder's scan, not
+the requester's. In a cluster where every pair exchanges rounds in both
+directions this is invisible: the peer's own round carries the same data the
+other way. It only bites under one-way reachability, which is the same topology
+constraint Section 8.2.1 records for a v1 hop — a mixed or partitioned cluster
+must stay meshed for the pairs that need to exchange data.
 
 `ensure_next_seq` bootstrap recovery simplifies: scan `origin_index` for own
 entries (one range scan) instead of scanning all logs plus the data map.
@@ -396,12 +440,19 @@ backstop and the only ack authority.
 
 ### 3.11 Observability
 
-The v2 `Node::status()` exposes, per peer: `acks`/`peer_acks`, last successful
-round timestamp, last digest match/mismatch, entries merged/rejected counters,
-and pagination state. These replace the v1 `PeerStatus { ack, pack, logs }` and
-give embedders the signals needed to alarm on divergence and admission
-rejections. (In v1, a permanently diverged replica and a healthy one are
+`Node::status()` exposes the state digest, cluster-wide entries
+merged/rejected counters, and per peer `acks`/`peer_acks` plus whether the peer
+has ever been heard from. `SyncManager::link_status()` adds, per link, the
+negotiated protocol, consecutive digest mismatches, and consecutive round
+failures. Together these replace the v1 `PeerStatus { ack, pack, logs }` and
+carry the signals needed to alarm on divergence and on a peer that fails every
+round. (In v1, a permanently diverged replica and a healthy one are
 indistinguishable from status output.)
+
+Not implemented, and deliberately listed rather than assumed: last-successful-
+round timestamps, pagination state, and per-origin rejection counts. The first
+two are bookkeeping the sync loop does not currently keep; the third needs
+`merge` to attribute rejections by origin, which it does not.
 
 ## 4. What gets deleted
 
@@ -555,12 +606,30 @@ its data (the shim path above). Both directions run every interval from both
 sides, so the propagation cost is at most one extra sync interval, only for
 v2 -> v1 pairs, only during the mixed window.
 
-**Relay through v1 nodes.** v1 nodes buffer v2-origin entries in their per-origin
-logs and relay them to other v1 peers. Holes in those logs are benign to v1 by
-P1/P2 (pull applies without gap checks; `local_ack` advances by max), and a
-front-hole rejection on a v1<->v1 push self-heals through the v1 pull path as it
-does today. UUID-based node-id-reuse detection is format-identical in both
-versions and keeps working across them.
+**No relay through v1 nodes.** An earlier draft of this section claimed that v1
+nodes buffer v2-origin entries in their per-origin logs and relay them onward.
+They do not, and the test
+`a_v1_hop_does_not_relay_so_the_cluster_must_stay_meshed` pins the actual
+behaviour. `apply_pulled_entries` writes what it pulled into the data map only,
+never into the per-origin logs that v1's incremental server path reads, so a v1
+node answers an already-covered peer with an empty response indefinitely. This
+is origin-agnostic and predates v2: v1 has never relayed data it learned by
+pulling.
+
+This is a topology constraint, not a defect introduced by the migration. Two
+nodes that must exchange data need a direct edge, which is what auto-discovery
+and the bootnode establish — a node joining with an empty ack map receives a
+full dump, the one path on which a v1 node does hand on everything it holds. A
+partially connected mixed cluster would not converge, in exactly the way a
+partially connected v1 cluster does not converge today.
+
+Holes in v1's logs remain benign by P1/P2 (pull applies without gap checks;
+`local_ack` advances by max), and a front-hole rejection on a v1<->v1 push
+self-heals through the v1 pull path as it does today. UUID-based node-id-reuse
+detection is format-identical in both versions and keeps working across them;
+it is applied to inbound requests only, since a node whose data directory was
+recreated returns with the same id and a new uuid and can only republish its
+identity in a response.
 
 Behavior matrix:
 
@@ -578,12 +647,21 @@ transition:
 
 - **Snapshot**: v2 writes the v1 `SnapshotFile`/`CoreState` container — `data`
   unchanged, `peers` populated with the v2 acks and **empty log VecDeques**,
-  same `SnapshotFile::VERSION`. A v1 binary loads it; empty logs simply mean
+  same `SnapshotFile::VERSION`. Note that `peers` carries both membership and
+  ack coverage with no way to tell them apart, which is why `RemovePeer` drops
+  the retired peer's ack: an ack outliving its membership reappears as a member
+  on the next load. A v1 binary loads it; empty logs simply mean
   the node answers early pulls with full dumps until its logs repopulate. No
   data loss. (`origin_index` is derived and never persisted.)
-- **WAL**: v2 writes only `Set`/`Clear`, a strict subset of the v1 op set; v1
-  replay handles it natively. v1 WALs replay on v2 with the log-manipulating
-  ops (`PushPeerLog` etc.) mapped to index/ack updates or ignored.
+- **WAL**: v2 writes `Set`/`Clear` and the membership ops `AddPeer`/`RemovePeer`
+  — a strict subset of the v1 op set, at identical `StateOp` discriminants, so
+  v1 replay handles them natively. (Membership is durable because the tombstone
+  GC watermark is a minimum over known peers: a peer forgotten in a crash would
+  let the node collect tombstones that peer never covered.) Ack bookkeeping is
+  deliberately *not* durable — a lost ack costs one larger delta — and `next_seq`
+  is recovered from the replayed entries themselves. v1 WALs replay on v2 with
+  the log-manipulating ops (`PushPeerLog` etc.) mapped to index/ack updates or
+  ignored.
 - **Last resort**: wiping the local data dir and re-bootstrapping from peers
   works across versions in both directions, because bootstrap is just "sync
   with empty acks" in v2 and "full dump" in v1, and the shim bridges the two.
@@ -634,7 +712,7 @@ e2e harness is the reference environment):
 6. Fault injection on v2<->v2: drop/duplicate/reorder envelopes, kill mid-
    pagination, per-entry admission failures; assert INV via digest equality
    after quiescence (property-based where practical).
-7. Clock skew: a node with +1h wall clock; assert clamping bounds the damage
+7. Clock skew: a node with +1h wall clock; assert rejection bounds the damage
    and `force_put` recovers a poisoned key.
 
 ## 9. Performance notes
@@ -679,7 +757,8 @@ e2e harness is the reference environment):
 
 - **HLC**: unify `(timestamp, seq)` into a hybrid logical clock; ack maps range
   over HLC values; removes the separate seq-recovery logic and strengthens the
-  clock-skew story beyond clamping. Wire-breaking; requires the Phase 2 gate.
+  clock-skew story beyond drift rejection. Wire-breaking; requires the Phase 2
+  gate.
 - **Bucketed digests / Merkle Search Tree**: localize divergence repair to key
   ranges instead of resetting a peer's acks wholesale; introducible via the
   optional digest field without a new wire version.
