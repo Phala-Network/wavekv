@@ -122,9 +122,10 @@ impl WriteAheadLog {
             }
 
             if header.node_id != self.node_id {
-                warn!(
-                    "WAL file node_id mismatch: expected {}, found {}",
-                    self.node_id, header.node_id
+                bail!(
+                    "WAL node_id mismatch: expected {}, found {}",
+                    self.node_id,
+                    header.node_id
                 );
             }
 
@@ -194,8 +195,11 @@ impl WriteAheadLog {
 
         loop {
             let mut entry_len_bytes = [0u8; 4];
-            if reader.read_exact(&mut entry_len_bytes).is_err() {
-                break;
+            if let Err(err) = reader.read_exact(&mut entry_len_bytes) {
+                if err.kind() == ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(err).context("Failed to scan WAL entry length");
             }
             let entry_len = u32::from_le_bytes(entry_len_bytes);
 
@@ -206,8 +210,11 @@ impl WriteAheadLog {
             }
 
             let mut entry_bytes = vec![0u8; entry_len as usize];
-            if reader.read_exact(&mut entry_bytes).is_err() {
-                break;
+            if let Err(err) = reader.read_exact(&mut entry_bytes) {
+                if err.kind() == ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(err).context("Failed to scan WAL entry body");
             }
 
             let entry = match bincode::serde::decode_from_slice::<WalEntry, _>(
@@ -281,8 +288,6 @@ impl WriteAheadLog {
         let file = File::open(&self.file_path)?;
         let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
-        let mut consumed = 0u64;
-
         // Skip header
         let header = self.read_header(&mut reader)?;
         if header.node_id != self.node_id {
@@ -295,6 +300,7 @@ impl WriteAheadLog {
         if !header.is_valid() {
             bail!("WAL header is invalid");
         }
+        let mut consumed = reader.stream_position()?;
 
         let mut entries = Vec::new();
 
@@ -532,11 +538,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = wal_with(dir.path(), &[op("a", 1)]);
 
-        let foreign = WriteAheadLog::new(&path, 2).expect("opening only warns");
-        let err = foreign
-            .read_all_ops()
-            .expect_err("replaying node 1's WAL as node 2 must fail");
+        let before = fs_err::read(&path).unwrap();
+        let err = match WriteAheadLog::new(&path, 2) {
+            Ok(_) => panic!("opening another node's WAL must fail before mutating it"),
+            Err(err) => err,
+        };
+
         assert!(err.to_string().contains("node_id mismatch"), "{err}");
+        assert_eq!(fs_err::read(&path).unwrap(), before);
     }
 
     /// A header the current build does not understand is likewise fatal, not skippable.

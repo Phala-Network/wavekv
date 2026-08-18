@@ -81,6 +81,11 @@ pub struct NodeState {
     /// Tracks whether state has unpersisted changes
     dirty: bool,
 
+    /// Cached encoded payload size used by admission control. Derived from `core.data`
+    /// and maintained with every Set/Clear so ingest does not scan the full map for
+    /// each entry in a batch.
+    data_bytes: usize,
+
     config: NodeConfig,
 
     /// Keys written locally since the last opportunistic push (RFC 3.9).
@@ -112,6 +117,10 @@ struct SnapshotFile {
     version: u32,
     node_id: NodeId,
     core: CoreState,
+}
+
+fn entry_storage_bytes(entry: &Entry) -> usize {
+    entry.key.len() + entry.value.as_ref().map_or(0, Vec::len)
 }
 
 impl SnapshotFile {
@@ -328,11 +337,30 @@ impl NodeState {
     }
 
     fn execute_op(&mut self, op: StateOp) {
+        let size_change = match &op {
+            StateOp::Set(entry) => {
+                let old = self
+                    .core
+                    .data()
+                    .get(&entry.key)
+                    .map_or(0, entry_storage_bytes);
+                Some((old, entry_storage_bytes(entry)))
+            }
+            StateOp::Clear(key) => self
+                .core
+                .data()
+                .get(key)
+                .map(|entry| (entry_storage_bytes(entry), 0)),
+            _ => None,
+        };
         let changed_key = match &op {
             StateOp::Set(entry) => Some(entry.key.clone()),
             _ => None,
         };
         self.core.execute(op);
+        if let Some((old, new)) = size_change {
+            self.data_bytes = self.data_bytes.saturating_sub(old).saturating_add(new);
+        }
         if let Some(key) = changed_key {
             self.notify_watchers(&key);
         }
@@ -356,16 +384,10 @@ impl NodeState {
         }
         // Capacity is only consulted for keys that would be newly created.
         if !self.core.data().contains_key(&entry.key) {
-            let bytes: usize = self
-                .core
-                .data()
-                .values()
-                .map(|e| e.key.len() + e.value.as_ref().map_or(0, |v| v.len()))
-                .sum();
             if let Admission::Reject { reason } = self
                 .config
                 .limits
-                .check_capacity(self.core.data().len(), bytes)
+                .check_capacity(self.core.data().len(), self.data_bytes)
             {
                 return Admission::Reject { reason };
             }
@@ -988,6 +1010,7 @@ impl Node {
             snapshot_path: None,
             watchers: Vec::new(),
             dirty: false,
+            data_bytes: 0,
             config,
             pending_push: Vec::new(),
             entries_merged: 0,
@@ -1031,6 +1054,7 @@ impl Node {
             snapshot_path: Some(snapshot_path.clone()),
             watchers: Vec::new(),
             dirty: false,
+            data_bytes: 0,
             config,
             pending_push: Vec::new(),
             entries_merged: 0,
@@ -1041,6 +1065,7 @@ impl Node {
         if state.load_snapshot_if_exists()? {
             info!("loaded snapshot from {}", snapshot_path.display());
         }
+        state.data_bytes = state.core.data().values().map(entry_storage_bytes).sum();
 
         if !existing_ops.is_empty() {
             info!(

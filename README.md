@@ -18,6 +18,11 @@ WaveKV is an embeddable Rust library for building distributed key-value stores. 
 - **Eventual Sync**: Nodes exchange *deltas* — the subset of live entries a peer has not yet covered, computed by filtering the data map against that peer's ack map. Bootstrap is the same operation against an empty ack map, so there is no separate full-dump path. A background loop keeps trying until it works, and a state digest detects any replica that has silently diverged.
 - **Auto Discovery**: Incoming sync traffic automatically registers the sender as a peer, so a new node can simply point at any existing node and learn about the rest.
 
+The protocol, its coverage invariant, mixed-version behavior, and rollout procedure are
+specified in [RFC 0001](rfcs/0001-delta-state-sync.md). Applications own the transport
+encoding and routing; during a rolling upgrade they must expose both the legacy v1
+exchange endpoint and the native v2 envelope endpoint as described in the RFC.
+
 
 ## Limitations and Non-goals
 
@@ -26,7 +31,7 @@ WaveKV intentionally does NOT provide:
 - **Strong consistency or linearizability**: Only eventual consistency with last-writer-wins based on `(timestamp, origin node id, seq)`.
 - **ACID transactions or CAS**: No transactional isolation, no compare-and-swap operations.
 - **Authentication or access control**: No built-in security mechanisms.
-- **Production-grade durability**: WAL preallocates and fsyncs, but there are no comprehensive checkpoints beyond the snapshot files used by the demo scripts.
+- **Storage-engine guarantees beyond local crash recovery**: The WAL and snapshots are fsynced and tolerate a damaged WAL tail, but WaveKV is not a replacement for backups, disk redundancy, or application-level disaster recovery.
 - **Network protocol implementation**: Transport layer is the application's responsibility.
 - **Large dataset support**: In-memory design limits data size to available RAM.
 - **Query language or secondary indexes**: Simple key-value interface only.
