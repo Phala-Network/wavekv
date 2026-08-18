@@ -393,6 +393,42 @@ impl WriteAheadLog {
         self.open_for_writing()
     }
 
+    /// Atomically replace the WAL with a fresh header followed by `ops`.
+    ///
+    /// The existing WAL remains authoritative until the replacement has been fully
+    /// written and fsynced. This is used after snapshotting: an ENOSPC/EIO while
+    /// preserving writes that raced the snapshot must not delete their old WAL copy.
+    pub fn replace_with_ops(&mut self, ops: &[StateOp]) -> Result<()> {
+        let tmp_path = self.file_path.with_extension("wal.tmp");
+        if let Err(err) = fs::remove_file(&tmp_path) {
+            if err.kind() != ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
+
+        let mut replacement = WriteAheadLog::new(&tmp_path, self.node_id)?;
+        if let Err(err) = replacement
+            .write_ops(ops)
+            .and_then(|()| replacement.close())
+        {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+
+        self.close()?;
+        if let Err(err) = fs::rename(&tmp_path, &self.file_path) {
+            // The rename did not happen, so reopen the still-authoritative old WAL.
+            let _ = self.open_for_writing();
+            return Err(err.into());
+        }
+        if let Some(parent) = self.file_path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+
+        self.sequence = 0;
+        self.open_for_writing()
+    }
+
     pub fn path(&self) -> &Path {
         &self.file_path
     }

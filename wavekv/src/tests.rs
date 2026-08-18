@@ -11,6 +11,29 @@ fn uuid_for(node: NodeId) -> Vec<u8> {
     format!("uuid-of-node-{node}").into_bytes()
 }
 
+#[test]
+fn a_panic_under_the_write_lock_does_not_wedge_the_node() {
+    let store = Node::new(1, vec![]);
+    store
+        .write()
+        .put("key".to_string(), b"value".to_vec())
+        .unwrap();
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = store.write();
+        panic!("boom");
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(
+        store.read().get("key").unwrap().value.as_deref(),
+        Some(b"value".as_slice())
+    );
+    store
+        .write()
+        .put("key2".to_string(), b"value2".to_vec())
+        .unwrap();
+}
+
 /// The peer's *server side*, entered where a real request enters it.
 ///
 /// `SyncManager` is the receive-side boundary: `check_uuid` runs there, and so will
