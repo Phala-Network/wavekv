@@ -24,7 +24,7 @@ use tokio::{
 use tracing::{error, info, warn};
 use wavekv::{
     node::Node,
-    sync::{ExchangeInterface, SyncManager, SyncMessage, SyncResponse},
+    sync::{ExchangeInterface, SyncEnvelope, SyncManager, SyncMessage, SyncResponse},
     types::NodeId,
 };
 
@@ -137,6 +137,37 @@ impl ExchangeInterface for HttpNetwork {
 
         Ok(sync_resp)
     }
+
+    /// v2 leg. Returns `Ok(None)` when the peer has no `/sync2` route, which is the
+    /// signal the SyncManager uses to record the peer as v1-only and fall back. This
+    /// probe-and-cache pattern is the recommended embedder negotiation (RFC 8.2).
+    async fn sync_v2_to(
+        &self,
+        node: &Node,
+        peer: NodeId,
+        env: SyncEnvelope,
+    ) -> Result<Option<SyncEnvelope>> {
+        let addr = Self::get_peer_addr(node, peer)
+            .ok_or_else(|| anyhow::anyhow!("Peer {} address not found in DB", peer))?;
+
+        let resp = self
+            .client
+            .post(format!("{addr}/sync2"))
+            .body(env.encode()?)
+            .header("content-type", "application/msgpack")
+            .send()
+            .await
+            .context("Failed to send v2 sync request")?;
+
+        if matches!(
+            resp.status(),
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Ok(None);
+        }
+        let body = resp.error_for_status()?.bytes().await?;
+        Ok(Some(SyncEnvelope::decode(&body)?))
+    }
 }
 
 #[tokio::main]
@@ -230,6 +261,7 @@ async fn run_node(
     // Start HTTP server
     let app = Router::new()
         .route("/sync", post(handle_sync))
+        .route("/sync2", post(handle_sync_v2))
         .route("/debug/state", get(handle_debug_state))
         .route("/debug/files", get(handle_debug_files))
         .route("/debug/raw", get(handle_debug_raw))
@@ -396,6 +428,32 @@ async fn sync_wavekv_to_filesystem(node: &Node, watch_dir: &Path) -> Result<()> 
     Ok(())
 }
 
+/// Native v2 endpoint. Peers that only know v1 never call this and keep using
+/// `/sync`, which the v2 node serves through its compatibility shim.
+async fn handle_sync_v2(
+    AxumState(state): AxumState<Arc<SyncManagerState>>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let env = match SyncEnvelope::decode(&body) {
+        Ok(env) => env,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e:#}").into_bytes()),
+    };
+    match state
+        .sync_manager
+        .handle_envelope(env)
+        .and_then(|resp| resp.encode())
+    {
+        Ok(bytes) => (StatusCode::OK, bytes),
+        Err(e) => {
+            error!("v2 sync failed: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{e:#}").into_bytes(),
+            )
+        }
+    }
+}
+
 async fn handle_sync(
     AxumState(state): AxumState<Arc<SyncManagerState>>,
     Json(msg): Json<SyncMessage>,
@@ -439,7 +497,9 @@ struct DebugEntry {
 
 #[derive(Serialize)]
 struct DebugPeerState {
-    log_size: usize,
+    /// How far this node covers the peer's writes.
+    ack: u64,
+    /// How far the peer reported covering ours.
     peer_ack: u64,
 }
 
@@ -465,7 +525,7 @@ async fn handle_debug_state(
 
     let node_id = node.id;
     let peers = node.get_peers();
-    let local_ack = node.get_local_ack();
+    let local_ack = node.acks_snapshot();
 
     // Get all KV entries
     let all_entries = node.get_all_including_tombstones();
@@ -487,16 +547,17 @@ async fn handle_debug_state(
 
     // Get peer states
     let mut peer_states = HashMap::new();
-    for peer_id in &peers {
-        if let Some(peer_state) = node.get_peer_state(*peer_id) {
-            peer_states.insert(
-                *peer_id,
-                DebugPeerState {
-                    log_size: peer_state.log.len(),
-                    peer_ack: peer_state.peer_ack,
-                },
-            );
+    for peer in node.status().peers {
+        if peer.id == node_id {
+            continue;
         }
+        peer_states.insert(
+            peer.id,
+            DebugPeerState {
+                ack: peer.ack,
+                peer_ack: peer.peer_ack,
+            },
+        );
     }
 
     let response = DebugStateResponse {

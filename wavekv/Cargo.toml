@@ -1,6 +1,6 @@
 [package]
 name = "wavekv"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 authors = ["Kevin Wang <wy721@qq.com>"]
 description = "An embeddable, eventually consistent, distributed key-value store with peer-to-peer architecture"
@@ -11,7 +11,7 @@ documentation = "https://docs.rs/wavekv"
 readme = "../README.md"
 keywords = ["distributed", "kv", "p2p", "crdt", "eventual-consistency"]
 categories = ["database-implementations", "data-structures"]
-rust-version = "1.70"
+rust-version = "1.82"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -31,6 +31,9 @@ fs-err = "3.2.0"
 serde-human-bytes = "0.1.1"
 
 [dev-dependencies]
+# The real, unmodified v1 crate. Mixed-version tests run an actual v1 node
+# in-process against v2 rather than against a hand-written stub.
+wavekv_v1 = { package = "wavekv", version = "1.0" }
 tempfile = "3"
 rand = "0.9.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

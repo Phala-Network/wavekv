@@ -5,8 +5,8 @@ WaveKV is an embeddable Rust library for building distributed key-value stores. 
 **Key characteristics:**
 - **Peer-to-peer architecture**: All nodes have equal roles. No leader, no coordinator, no special node types.
 - **No minimum cluster size**: Works with a single node or any number of nodes. Scale freely without reconfiguration.
-- **Last-write-wins conflict resolution**: Conflicts are resolved automatically based on `(timestamp, origin node id)`. Simple and deterministic.
-- **Eventually consistent**: Log-driven replication ensures all nodes converge to the same state. No transactions or quorum reads/writes.
+- **Last-write-wins conflict resolution**: Conflicts are resolved automatically based on `(timestamp, origin node id, seq)`. Simple and deterministic.
+- **Eventually consistent**: Delta-state replication ensures all nodes converge to the same state. No transactions or quorum reads/writes.
 - **Embeddable library**: Not a standalone application. Designed to be embedded into your Rust programs.
 - **Core only**: Provides the replication algorithm and state management. Network transport is left to the application layer.
 - **In-memory storage**: Keeps all data in memory. Best suited for small to medium datasets that fit in RAM.
@@ -14,19 +14,24 @@ WaveKV is an embeddable Rust library for building distributed key-value stores. 
 ## What it actually does
 
 - **Single Source of Truth**: Every mutation becomes a `StateOp` and is appended to a write-ahead log (WAL). Recovery replays the exact same ops.
-- **Simple Core State**: `CoreState` only tracks three things—KV data, peer metadata (logs + ack progress), and `next_seq`.
-- **Eventual Sync**: Nodes exchange incremental logs plus snapshots when peers fall behind. A background loop keeps trying until it works.
+- **Simple Core State**: `CoreState` tracks the KV data, a secondary `(origin, seq) -> key` index over it, per-origin ack progress, and `next_seq`. There is no second copy of any entry.
+- **Eventual Sync**: Nodes exchange *deltas* — the subset of live entries a peer has not yet covered, computed by filtering the data map against that peer's ack map. Bootstrap is the same operation against an empty ack map, so there is no separate full-dump path. A background loop keeps trying until it works, and a state digest detects any replica that has silently diverged.
 - **Auto Discovery**: Incoming sync traffic automatically registers the sender as a peer, so a new node can simply point at any existing node and learn about the rest.
+
+The protocol, its coverage invariant, mixed-version behavior, and rollout procedure are
+specified in [RFC 0001](rfcs/0001-delta-state-sync.md). Applications own the transport
+encoding and routing; during a rolling upgrade they must expose both the legacy v1
+exchange endpoint and the native v2 envelope endpoint as described in the RFC.
 
 
 ## Limitations and Non-goals
 
 WaveKV intentionally does NOT provide:
 
-- **Strong consistency or linearizability**: Only eventual consistency with last-writer-wins based on `(timestamp, origin node id)`.
+- **Strong consistency or linearizability**: Only eventual consistency with last-writer-wins based on `(timestamp, origin node id, seq)`.
 - **ACID transactions or CAS**: No transactional isolation, no compare-and-swap operations.
 - **Authentication or access control**: No built-in security mechanisms.
-- **Production-grade durability**: WAL preallocates and fsyncs, but there are no comprehensive checkpoints beyond the snapshot files used by the demo scripts.
+- **Storage-engine guarantees beyond local crash recovery**: The WAL and snapshots are fsynced and tolerate a damaged WAL tail, but WaveKV is not a replacement for backups, disk redundancy, or application-level disaster recovery.
 - **Network protocol implementation**: Transport layer is the application's responsibility.
 - **Large dataset support**: In-memory design limits data size to available RAM.
 - **Query language or secondary indexes**: Simple key-value interface only.

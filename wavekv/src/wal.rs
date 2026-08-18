@@ -122,14 +122,30 @@ impl WriteAheadLog {
             }
 
             if header.node_id != self.node_id {
-                warn!(
-                    "WAL file node_id mismatch: expected {}, found {}",
-                    self.node_id, header.node_id
+                bail!(
+                    "WAL node_id mismatch: expected {}, found {}",
+                    self.node_id,
+                    header.node_id
                 );
             }
 
-            // Find the last sequence number
-            self.sequence = self.find_last_sequence(&mut reader)?;
+            // Find the last sequence number and where the undamaged prefix ends.
+            let file_len = file.metadata()?.len();
+            let (last_sequence, valid_end) = self.scan_valid_prefix(&mut reader, file_len)?;
+            self.sequence = last_sequence;
+
+            // Drop a torn tail before appending. Replay stops at the first damaged
+            // record, so anything written past it would be unreachable forever — an
+            // fsynced write silently lost on the next restart.
+            if valid_end < file_len {
+                warn!(
+                    "discarding {} damaged byte(s) at the end of {:?}",
+                    file_len - valid_end,
+                    self.file_path
+                );
+                file.set_len(valid_end)?;
+                file.sync_all()?;
+            }
 
             let writer = BufWriter::new(file);
             self.writer = Some(writer);
@@ -156,7 +172,17 @@ impl WriteAheadLog {
         Ok(header)
     }
 
-    fn find_last_sequence<R: Read + Seek>(&self, reader: &mut R) -> Result<u64> {
+    /// Scan the record region and report the last intact sequence number together with
+    /// the byte offset at which the undamaged prefix ends.
+    ///
+    /// The stopping rules mirror `read_all_ops` exactly: whatever replay refuses to
+    /// cross is what the writer must overwrite. If the two ever disagreed, records
+    /// would land on the far side of a wall replay never passes.
+    fn scan_valid_prefix<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        file_len: u64,
+    ) -> Result<(u64, u64)> {
         let mut last_sequence = 0;
 
         // Skip header by seeking past it
@@ -165,43 +191,52 @@ impl WriteAheadLog {
         reader.read_exact(&mut len_bytes)?;
         let header_len = u32::from_le_bytes(len_bytes) as u64;
         reader.seek(SeekFrom::Current(header_len as i64))?;
+        let mut valid_end = 4 + header_len;
 
-        // Read entries to find the last sequence
         loop {
             let mut entry_len_bytes = [0u8; 4];
-            match reader.read_exact(&mut entry_len_bytes) {
-                Ok(_) => {
-                    let entry_len = u32::from_le_bytes(entry_len_bytes);
-                    let mut entry_bytes = vec![0u8; entry_len as usize];
-
-                    match reader.read_exact(&mut entry_bytes) {
-                        Ok(_) => {
-                            if let Ok((entry, _)) = bincode::serde::decode_from_slice::<WalEntry, _>(
-                                &entry_bytes,
-                                bincode::config::standard(),
-                            ) {
-                                if entry.verify_checksum() {
-                                    last_sequence = entry.sequence;
-                                } else {
-                                    warn!(
-                                        "Corrupted WAL entry found, sequence: {}",
-                                        entry.sequence
-                                    );
-                                    break;
-                                }
-                            } else {
-                                warn!("Failed to deserialize WAL entry");
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
+            if let Err(err) = reader.read_exact(&mut entry_len_bytes) {
+                if err.kind() == ErrorKind::UnexpectedEof {
+                    break;
                 }
-                Err(_) => break,
+                return Err(err).context("Failed to scan WAL entry length");
             }
+            let entry_len = u32::from_le_bytes(entry_len_bytes);
+
+            // A corrupt length field must not turn into a multi-gigabyte allocation.
+            if entry_len as u64 > file_len.saturating_sub(valid_end + 4) {
+                warn!("WAL entry claims {entry_len} bytes but the file is shorter; stopping scan");
+                break;
+            }
+
+            let mut entry_bytes = vec![0u8; entry_len as usize];
+            if let Err(err) = reader.read_exact(&mut entry_bytes) {
+                if err.kind() == ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(err).context("Failed to scan WAL entry body");
+            }
+
+            let entry = match bincode::serde::decode_from_slice::<WalEntry, _>(
+                &entry_bytes,
+                bincode::config::standard(),
+            ) {
+                Ok((entry, _)) => entry,
+                Err(_) => {
+                    warn!("Failed to deserialize WAL entry");
+                    break;
+                }
+            };
+            if !entry.verify_checksum() {
+                warn!("Corrupted WAL entry found, sequence: {}", entry.sequence);
+                break;
+            }
+
+            last_sequence = entry.sequence;
+            valid_end += 4 + entry_len as u64;
         }
 
-        Ok(last_sequence)
+        Ok((last_sequence, valid_end))
     }
 
     /// Write a state operation to the WAL
@@ -241,10 +276,18 @@ impl WriteAheadLog {
     }
 
     /// Read all state operations from the WAL for recovery
+    /// Replay every op in the WAL.
+    ///
+    /// A torn or corrupt tail is treated as truncation — warn and stop — rather than as
+    /// a fatal error. WaveKV state is fully replicated, so the correct response to local
+    /// persistence damage is to quarantine the damaged suffix and re-sync from peers,
+    /// never a permanent refusal to start (RFC 0001 section 3.10). `scan_valid_prefix`
+    /// stops on exactly the same conditions, so the writer truncates precisely what
+    /// replay refuses to cross.
     pub fn read_all_ops(&self) -> Result<Vec<StateOp>> {
         let file = File::open(&self.file_path)?;
+        let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
-
         // Skip header
         let header = self.read_header(&mut reader)?;
         if header.node_id != self.node_id {
@@ -257,6 +300,7 @@ impl WriteAheadLog {
         if !header.is_valid() {
             bail!("WAL header is invalid");
         }
+        let mut consumed = reader.stream_position()?;
 
         let mut entries = Vec::new();
 
@@ -272,27 +316,49 @@ impl WriteAheadLog {
                 }
             };
 
+            consumed += 4;
+            // A corrupt length field must not turn into a multi-gigabyte allocation.
+            let remaining = file_len.saturating_sub(consumed);
+            if entry_len as u64 > remaining {
+                warn!(
+                    "WAL entry claims {entry_len} bytes but only {remaining} remain; \
+                     treating the tail as truncated and stopping replay"
+                );
+                break;
+            }
+
             let mut entry_bytes = vec![0u8; entry_len as usize];
             match reader.read_exact(&mut entry_bytes) {
                 Ok(_) => {}
                 Err(err) => {
                     if err.kind() == ErrorKind::UnexpectedEof {
                         warn!(
-                            "Encountered truncated WAL entry (expected {} bytes); stopping replay",
-                            entry_len
+                            "encountered truncated WAL entry (expected {entry_len} bytes); \
+                             stopping replay"
                         );
                         break;
                     }
-                    Err(err).context("Failed to read WAL entry")?;
+                    Err(err).context("failed to read WAL entry")?;
                 }
             }
-            let (wal_entry, _) = bincode::serde::decode_from_slice::<WalEntry, _>(
+            consumed += entry_len as u64;
+
+            let wal_entry = match bincode::serde::decode_from_slice::<WalEntry, _>(
                 &entry_bytes,
                 bincode::config::standard(),
-            )
-            .context("Failed to deserialize WAL entry")?;
+            ) {
+                Ok((entry, _)) => entry,
+                Err(err) => {
+                    warn!("undecodable WAL entry ({err}); treating the tail as truncated");
+                    break;
+                }
+            };
             if !wal_entry.verify_checksum() {
-                bail!("WAL entry corrupted");
+                // The checksum covers the canonical encoding of `state_op`, so this
+                // also catches a format drift that happened to decode into a different
+                // op — not just bit rot.
+                warn!("WAL entry failed its checksum; treating the tail as truncated");
+                break;
             }
             entries.push(wal_entry.state_op);
         }
@@ -337,5 +403,160 @@ impl Drop for WriteAheadLog {
         if let Err(e) = self.close() {
             error!("Error closing WAL in drop: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Entry, Metadata};
+
+    fn op(key: &str, seq: u64) -> StateOp {
+        StateOp::Set(Entry::new(
+            key.to_string(),
+            Some(b"v".to_vec()),
+            Metadata::new(1, seq, seq as i64),
+        ))
+    }
+
+    fn wal_with(dir: &std::path::Path, ops: &[StateOp]) -> std::path::PathBuf {
+        let path = dir.join("node_1.wal");
+        let mut wal = WriteAheadLog::new(&path, 1).expect("create wal");
+        wal.write_ops(ops).expect("write ops");
+        drop(wal);
+        path
+    }
+
+    fn keys_in(path: &std::path::Path) -> Vec<String> {
+        let wal = WriteAheadLog::new(path, 1).expect("reopen wal");
+        wal.read_all_ops()
+            .expect("replay must not fail on a damaged tail")
+            .into_iter()
+            .filter_map(|op| match op {
+                StateOp::Set(entry) => Some(entry.key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_clean_wal_replays_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1), op("b", 2), op("c", 3)]);
+        assert_eq!(keys_in(&path), vec!["a", "b", "c"]);
+    }
+
+    /// A crash mid-write leaves a partial record. WaveKV state is fully replicated, so
+    /// the right response is to drop the torn suffix and re-sync — never to refuse to
+    /// start, which would strand the node on a recoverable fault.
+    #[test]
+    fn a_torn_tail_truncates_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1), op("b", 2), op("c", 3)]);
+
+        let full_len = fs_err::metadata(&path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_len - 3).unwrap();
+        drop(file);
+
+        let keys = keys_in(&path);
+        assert_eq!(
+            keys,
+            vec!["a", "b"],
+            "the intact prefix must survive; only the torn record is dropped"
+        );
+    }
+
+    /// Recovering from a torn tail must also *remove* it. Appending after damage the
+    /// replay path stops at would put every subsequent record beyond a wall that replay
+    /// never crosses — silently losing writes that were acknowledged and fsynced.
+    #[test]
+    fn writes_after_a_torn_tail_recovery_survive_the_next_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1), op("b", 2)]);
+
+        let full_len = fs_err::metadata(&path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_len - 3).unwrap();
+        drop(file);
+
+        // First restart: replay drops the torn record, then the node takes a new write.
+        let mut wal = WriteAheadLog::new(&path, 1).expect("reopen after damage");
+        assert_eq!(
+            wal.read_all_ops().unwrap().len(),
+            1,
+            "the torn record must not replay"
+        );
+        wal.write_ops(&[op("c", 3)]).expect("write after recovery");
+        drop(wal);
+
+        // Second restart: `c` was fsynced, so it must still be there.
+        assert_eq!(keys_in(&path), vec!["a", "c"]);
+    }
+
+    /// A corrupt length prefix must not become a multi-gigabyte allocation.
+    #[test]
+    fn an_absurd_record_length_is_bounds_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1)]);
+
+        // Append a length header claiming far more than the file can hold.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        file.write_all(b"junk").unwrap();
+        drop(file);
+
+        assert_eq!(keys_in(&path), vec!["a"]);
+    }
+
+    /// Bit rot inside a record — or a format drift that happens to decode into a
+    /// different op — is caught by the CRC over the canonical encoding.
+    #[test]
+    fn a_checksum_failure_stops_replay_without_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1), op("bbbb", 2)]);
+
+        // Flip a byte inside the last record's payload.
+        let mut bytes = fs_err::read(&path).unwrap();
+        let last = bytes.len() - 6;
+        bytes[last] ^= 0xff;
+        fs_err::write(&path, &bytes).unwrap();
+
+        let keys = keys_in(&path);
+        assert!(
+            !keys.contains(&"bbbb".to_string()),
+            "a record failing its checksum must not be replayed: {keys:?}"
+        );
+        assert_eq!(keys, vec!["a"]);
+    }
+
+    /// The relaxed handling above applies to a damaged *tail* only. A WAL belonging to
+    /// another node is a misconfiguration, not corruption, so replay refuses it outright
+    /// rather than silently adopting another node's history.
+    #[test]
+    fn a_wal_from_another_node_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wal_with(dir.path(), &[op("a", 1)]);
+
+        let before = fs_err::read(&path).unwrap();
+        let err = match WriteAheadLog::new(&path, 2) {
+            Ok(_) => panic!("opening another node's WAL must fail before mutating it"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("node_id mismatch"), "{err}");
+        assert_eq!(fs_err::read(&path).unwrap(), before);
+    }
+
+    /// A header the current build does not understand is likewise fatal, not skippable.
+    #[test]
+    fn an_unrecognised_header_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_1.wal");
+        fs_err::write(&path, b"not a wal file at all").unwrap();
+        assert!(
+            WriteAheadLog::new(&path, 1).is_err(),
+            "a file without a valid WAL header must not be opened for appending"
+        );
     }
 }
