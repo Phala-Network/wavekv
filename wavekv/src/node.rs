@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn};
 
@@ -96,6 +96,47 @@ pub struct NodeState {
     /// Set while this node is bootstrapping, which suspends adoption of a *requester's*
     /// ack map. See [`NodeState::begin_bootstrap`].
     bootstrap_pending: bool,
+
+    /// Durable ops written after an in-flight snapshot was encoded.
+    wal_tail: Option<Vec<StateOp>>,
+}
+
+/// A snapshot encoded under the state lock and written after releasing it.
+struct PendingSnapshot {
+    path: PathBuf,
+    encoded: Vec<u8>,
+}
+
+impl PendingSnapshot {
+    fn write(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = self.path.with_extension("snapshot.tmp");
+        {
+            let mut writer = BufWriter::new(
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp_path)?,
+            );
+            writer.write_all(&self.encoded)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+
+        if self.path.exists() {
+            let backup = self.path.with_extension("snapshot.bak");
+            let _ = fs::rename(&self.path, &backup);
+        }
+        fs::rename(&tmp_path, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        debug!("persisted snapshot to {:?}", self.path);
+        Ok(())
+    }
 }
 
 enum WatchPattern {
@@ -162,6 +203,8 @@ impl SnapshotFile {
 #[derive(Clone)]
 pub struct Node {
     state: Arc<RwLock<NodeState>>,
+    /// Snapshot I/O runs outside `state`, so serialize snapshot writers separately.
+    persist_lock: Arc<Mutex<()>>,
 }
 
 impl NodeState {
@@ -218,47 +261,44 @@ impl NodeState {
     }
 
     pub fn persist_to_disk(&mut self) -> Result<()> {
-        let snapshot_path = self.snapshot_path()?.to_path_buf();
-        if let Some(parent) = snapshot_path.parent() {
-            fs::create_dir_all(parent)?;
+        let Some(pending) = self.begin_persist(true)? else {
+            return Ok(());
+        };
+        let written = pending.write();
+        self.finish_persist(written.is_ok())?;
+        written
+    }
+
+    fn begin_persist(&mut self, force: bool) -> Result<Option<PendingSnapshot>> {
+        if !force && !self.dirty {
+            return Ok(None);
+        }
+        if self.wal_tail.is_some() {
+            bail!("a snapshot is already in flight");
         }
 
-        let tmp_path = snapshot_path.with_extension("snapshot.tmp");
-        let snapshot = SnapshotFile::from_state(self);
-        let encoded = rmp_serde::to_vec(&snapshot)?;
-
-        {
-            let mut writer = BufWriter::new(
-                OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&tmp_path)?,
-            );
-            writer.write_all(&encoded)?;
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-        }
-
-        // Keep one previous generation as a fallback (RFC 3.10).
-        if snapshot_path.exists() {
-            let backup = snapshot_path.with_extension("snapshot.bak");
-            let _ = fs::rename(&snapshot_path, &backup);
-        }
-        fs::rename(&tmp_path, &snapshot_path)?;
-
-        if let Some(parent) = snapshot_path.parent() {
-            if let Ok(dir_file) = File::open(parent) {
-                let _ = dir_file.sync_all();
-            }
-        }
-
-        if let Some(wal) = self.wal.as_mut() {
-            wal.reset()?;
-        }
-
-        debug!("persisted snapshot to {:?}", snapshot_path);
+        let path = self.snapshot_path()?.to_path_buf();
+        let encoded = rmp_serde::to_vec(&SnapshotFile::from_state(self))?;
         self.dirty = false;
+        if self.wal.is_some() {
+            self.wal_tail = Some(Vec::new());
+        }
+        Ok(Some(PendingSnapshot { path, encoded }))
+    }
+
+    fn finish_persist(&mut self, written: bool) -> Result<()> {
+        let tail = self.wal_tail.take().unwrap_or_default();
+        if !written {
+            self.dirty = true;
+            return Ok(());
+        }
+        let Some(wal) = self.wal.as_mut() else {
+            return Ok(());
+        };
+        if let Err(err) = wal.replace_with_ops(&tail) {
+            self.dirty = true;
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -325,6 +365,9 @@ impl NodeState {
                     ops.iter().filter(|op| op.is_durable()).cloned().collect();
                 if !durable.is_empty() {
                     wal.write_ops(&durable)?;
+                    if let Some(tail) = self.wal_tail.as_mut() {
+                        tail.extend(durable);
+                    }
                 }
             }
         }
@@ -952,14 +995,6 @@ impl NodeState {
         self.core.next_seq()
     }
 
-    fn persist_if_dirty(&mut self) -> Result<bool> {
-        if !self.dirty {
-            return Ok(false);
-        }
-        self.persist_to_disk()?;
-        Ok(true)
-    }
-
     #[inline]
     fn mark_dirty(&mut self) {
         self.dirty = true;
@@ -1016,9 +1051,11 @@ impl Node {
             entries_merged: 0,
             entries_rejected: 0,
             bootstrap_pending: false,
+            wal_tail: None,
         };
         Self {
             state: Arc::new(RwLock::new(state)),
+            persist_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1060,6 +1097,7 @@ impl Node {
             entries_merged: 0,
             entries_rejected: 0,
             bootstrap_pending: false,
+            wal_tail: None,
         };
 
         if state.load_snapshot_if_exists()? {
@@ -1079,25 +1117,42 @@ impl Node {
 
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
+            persist_lock: Arc::new(Mutex::new(())),
         })
     }
 
     pub fn write(&self) -> RwLockWriteGuard<'_, NodeState> {
-        #[allow(clippy::expect_used)]
-        self.state.write().expect("lock should never fail")
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, NodeState> {
-        #[allow(clippy::expect_used)]
-        self.state.read().expect("lock should never fail")
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn persist(&self) -> Result<()> {
-        self.write().persist_to_disk()
+        self.persist_inner(true).map(|_| ())
     }
 
     pub fn persist_if_dirty(&self) -> Result<bool> {
-        self.write().persist_if_dirty()
+        self.persist_inner(false)
+    }
+
+    fn persist_inner(&self, force: bool) -> Result<bool> {
+        let _persist = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pending) = self.write().begin_persist(force)? else {
+            return Ok(false);
+        };
+
+        let written = pending.write();
+        self.write().finish_persist(written.is_ok())?;
+        written.map(|()| true)
     }
 
     pub fn state_digest(&self) -> StateDigest {
@@ -1110,5 +1165,67 @@ impl Node {
 
     pub fn watch_prefix(&self, prefix: &str) -> watch::Receiver<()> {
         self.write().watch_prefix(prefix)
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    fn value_of(node: &Node, key: &str) -> Option<Vec<u8>> {
+        node.read().get(key).and_then(|entry| entry.value)
+    }
+
+    #[test]
+    fn ops_applied_while_a_snapshot_is_in_flight_survive_the_wal_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        node.write().put("before".into(), b"1".to_vec()).unwrap();
+
+        let pending = node.write().begin_persist(false).unwrap().unwrap();
+        node.write().put("during".into(), b"2".to_vec()).unwrap();
+        pending.write().unwrap();
+        node.write().finish_persist(true).unwrap();
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        assert_eq!(
+            value_of(&reopened, "before").as_deref(),
+            Some(b"1".as_ref())
+        );
+        assert_eq!(
+            value_of(&reopened, "during").as_deref(),
+            Some(b"2".as_ref())
+        );
+    }
+
+    #[test]
+    fn a_failed_snapshot_write_leaves_the_wal_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        node.write().put("key".into(), b"value".to_vec()).unwrap();
+
+        fs::create_dir(dir.path().join("node_1.snapshot.tmp")).unwrap();
+        assert!(node.persist_if_dirty().is_err());
+        assert!(node.read().status().dirty);
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        assert_eq!(
+            value_of(&reopened, "key").as_deref(),
+            Some(b"value".as_ref())
+        );
+    }
+
+    #[test]
+    fn a_second_snapshot_cannot_start_while_one_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        node.write().put("key".into(), b"value".to_vec()).unwrap();
+
+        let pending = node.write().begin_persist(false).unwrap().unwrap();
+        assert!(node.write().persist_to_disk().is_err());
+        pending.write().unwrap();
+        node.write().finish_persist(true).unwrap();
     }
 }
