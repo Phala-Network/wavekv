@@ -454,7 +454,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "wavekv 2.0.0",
+ "wavekv 2.1.0",
 ]
 
 [[package]]
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "wavekv"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "bincode",

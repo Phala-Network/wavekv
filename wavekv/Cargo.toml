@@ -1,6 +1,6 @@
 [package]
 name = "wavekv"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["Kevin Wang <wy721@qq.com>"]
 description = "An embeddable, eventually consistent, distributed key-value store with peer-to-peer architecture"
