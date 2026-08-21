@@ -416,7 +416,9 @@ impl NodeState {
             return Ok(());
         }
 
-        if write_to_wal {
+        // Gated on there being a log at all: a memory-only node would otherwise
+        // clone every durable op for `append_durable` to discard.
+        if write_to_wal && self.wal.is_some() {
             let durable: Vec<StateOp> = ops.iter().filter(|op| op.is_durable()).cloned().collect();
             self.append_durable(&durable)?;
         }
@@ -467,7 +469,20 @@ impl NodeState {
     // -----------------------------------------------------------------------
 
     /// Admission checks applied to every entry arriving from a peer (RFC 3.8).
-    fn admit(&self, entry: &Entry, now_ms: i64) -> Admission {
+    /// Admit an entry, charging capacity against what `staged` has already
+    /// decided as well as against what the store holds.
+    ///
+    /// The adjustment is what keeps a round inside its limits. Nothing is
+    /// applied until the whole batch is in the log, so judging every entry
+    /// against the store as it stood before the round began would let one
+    /// envelope overshoot `max_keys` and `max_total_bytes` by a whole delta.
+    ///
+    /// There is exactly one capacity check. A second one against unadjusted
+    /// totals would not be harmless belt-and-braces: a round that shrinks
+    /// entries has a negative delta, so near `max_total_bytes` the unadjusted
+    /// figure is the larger of the two, and it would reject what this check
+    /// correctly admitted.
+    fn admit(&self, entry: &Entry, now_ms: i64, staged: &StagedBatch) -> Admission {
         if let Admission::Reject { reason } = self.config.limits.check_entry(entry) {
             return Admission::Reject { reason };
         }
@@ -475,12 +490,13 @@ impl NodeState {
             return Admission::Reject { reason };
         }
         // Capacity is only consulted for keys that would be newly created.
-        if !self.core.data().contains_key(&entry.key) {
-            if let Admission::Reject { reason } = self
-                .config
-                .limits
-                .check_capacity(self.core.data().len(), self.data_bytes)
-            {
+        let known =
+            self.core.data().contains_key(&entry.key) || staged.winner(&entry.key).is_some();
+        if !known {
+            if let Admission::Reject { reason } = self.config.limits.check_capacity(
+                self.core.data().len() + staged.new_keys,
+                self.data_bytes.saturating_add_signed(staged.bytes_delta),
+            ) {
                 return Admission::Reject { reason };
             }
         }
@@ -495,7 +511,7 @@ impl NodeState {
     /// Merge one entry under LWW. Returns whether local state changed.
     pub fn sync(&mut self, entry: Entry) -> Result<bool> {
         let now = Utc::now().timestamp_millis();
-        if let Admission::Reject { reason } = self.admit(&entry, now) {
+        if let Admission::Reject { reason } = self.admit(&entry, now, &StagedBatch::default()) {
             self.entries_rejected += 1;
             bail!("entry {} rejected: {reason}", entry.key);
         }
@@ -537,7 +553,7 @@ impl NodeState {
         let mut staged = StagedBatch::default();
 
         for entry in entries {
-            if let Admission::Reject { reason } = self.admit_staged(&entry, now, &staged) {
+            if let Admission::Reject { reason } = self.admit(&entry, now, &staged) {
                 self.entries_rejected += 1;
                 rejected += 1;
                 complete = false;
@@ -571,29 +587,6 @@ impl NodeState {
         self.entries_merged += merged as u64;
 
         (merged, rejected, complete)
-    }
-
-    /// Admission for an entry in a batch that has already decided others.
-    ///
-    /// Capacity is charged against what the batch will add, not only against
-    /// what the store already holds. Without that, deferring application to the
-    /// end of the round would let one envelope overshoot `max_keys` and
-    /// `max_total_bytes` by a whole delta.
-    fn admit_staged(&self, entry: &Entry, now_ms: i64, staged: &StagedBatch) -> Admission {
-        let known =
-            self.core.data().contains_key(&entry.key) || staged.winner(&entry.key).is_some();
-        if !known {
-            if let Admission::Reject { reason } = self.config.limits.check_capacity(
-                self.core.data().len() + staged.new_keys,
-                self.data_bytes.saturating_add_signed(staged.bytes_delta),
-            ) {
-                return Admission::Reject { reason };
-            }
-        }
-        // `admit` re-runs the capacity check for a key the store does not hold,
-        // against unadjusted totals; it can only be more permissive than the
-        // check above, which has already passed.
-        self.admit(entry, now_ms)
     }
 
     /// Append durable ops to the log, and to the tail an in-flight snapshot
@@ -1532,5 +1525,85 @@ mod persistence_tests {
         assert!(node.write().persist_to_disk().is_err());
         pending.write().unwrap();
         node.write().finish_persist(true).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod batch_admission_tests {
+    use super::*;
+    use crate::admission::Limits;
+
+    fn capped(max_total_bytes: usize) -> Node {
+        Node::with_config(
+            1,
+            vec![2],
+            NodeConfig {
+                limits: Limits {
+                    max_total_bytes,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A peer's entry, stamped now so it wins LWW against a local write made a
+    /// moment ago and still passes the clock-drift check.
+    fn from_peer(seq: u64, key: &str, len: usize) -> Entry {
+        Entry::new_put(
+            Metadata::new(2, seq, Utc::now().timestamp_millis() + 1_000),
+            key.to_string(),
+            vec![0u8; len],
+        )
+    }
+
+    /// A round that frees more than it adds must not be refused for want of the
+    /// room it is about to free.
+    ///
+    /// Capacity is charged against the batch's own net effect, which is negative
+    /// when it shrinks entries. Checking a second time against the store's
+    /// unadjusted total would not be a harmless belt-and-braces: near the cap
+    /// the unadjusted figure is the larger one, so it rejects what the adjusted
+    /// check correctly admitted, and the round is parked until some other write
+    /// happens to shrink the store first.
+    #[test]
+    fn a_batch_that_frees_more_than_it_adds_is_not_refused_for_space() {
+        let node = capped(1_000);
+        // Local writes bypass admission, so the store can start over its cap.
+        node.write().put("big".into(), vec![0u8; 1_200]).unwrap();
+        assert!(node.read().data_bytes > 1_000);
+
+        let (merged, rejected, complete) = node
+            .write()
+            .merge_batch(vec![from_peer(1, "big", 10), from_peer(2, "small", 10)]);
+
+        assert_eq!(
+            (merged, rejected, complete),
+            (2, 0, true),
+            "the new key fits once the batch's own shrink is accounted for"
+        );
+        assert!(node.read().get("small").is_some());
+    }
+
+    /// The adjustment cuts the other way too: a batch may not walk past the cap
+    /// just because every entry in it was judged against the store as it was
+    /// before the round started.
+    #[test]
+    fn a_batch_cannot_overshoot_the_cap_one_entry_at_a_time() {
+        let node = capped(1_000);
+
+        let entries: Vec<Entry> = (0..20)
+            .map(|i| from_peer(i + 1, &format!("k-{i}"), 100))
+            .collect();
+        let (merged, rejected, complete) = node.write().merge_batch(entries);
+
+        assert!(rejected > 0, "the batch was allowed past the cap");
+        assert!(!complete, "a refusal must park ack adoption");
+        assert!(merged < 20);
+        assert!(
+            node.read().data_bytes <= 1_000 + 105,
+            "overshot by more than the entry that crossed the line: {}",
+            node.read().data_bytes
+        );
     }
 }
