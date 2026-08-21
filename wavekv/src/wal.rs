@@ -69,6 +69,13 @@ pub struct WriteAheadLog {
     writer: Option<BufWriter<File>>,
     sequence: u64,
     node_id: NodeId,
+    /// How many times [`Self::write_ops`] has forced the log to disk.
+    ///
+    /// An fsync costs four to five orders of magnitude more than the append it
+    /// follows, so how many of them a write path performs is a property worth
+    /// asserting rather than timing: a test can pin "one batch, one fsync"
+    /// directly, and it stays pinned when someone reshapes the call path.
+    syncs: u64,
 }
 
 impl WriteAheadLog {
@@ -79,6 +86,7 @@ impl WriteAheadLog {
         let mut wal = Self {
             file_path,
             writer: None,
+            syncs: 0,
             sequence: 0,
             node_id,
         };
@@ -271,8 +279,20 @@ impl WriteAheadLog {
 
         writer.flush()?;
         writer.get_ref().sync_all()?;
+        self.syncs += 1;
 
         Ok(())
+    }
+
+    /// How many times [`Self::write_ops`] has forced this log to disk since it
+    /// was opened.
+    ///
+    /// Appends only. A rotation ([`Self::replace_with_ops`]) forces the disk
+    /// too — for the replacement file and its directory entry — and is not
+    /// counted here, because what this number exists to explain is the cost a
+    /// write path pays, and a rotation is not on one.
+    pub fn sync_count(&self) -> u64 {
+        self.syncs
     }
 
     /// Read all state operations from the WAL for recovery

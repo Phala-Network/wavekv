@@ -160,6 +160,63 @@ struct SnapshotFile {
     core: CoreState,
 }
 
+/// Whether `candidate` should replace what is currently held for its key.
+///
+/// The one place the LWW rule is spelled out, so a batch and a single merge
+/// cannot drift apart on it.
+fn beats(current: Option<&Entry>, candidate: &Entry) -> bool {
+    match current {
+        Some(current) => compare_entries(current, candidate) == std::cmp::Ordering::Less,
+        None => true,
+    }
+}
+
+/// The winners a merge round has decided so far, plus what they will cost the
+/// store, so that later entries in the same round are judged against them.
+#[derive(Default)]
+struct StagedBatch {
+    winners: Vec<Entry>,
+    /// Position in `winners` for each staged key.
+    index: HashMap<String, usize>,
+    /// Entries that beat what was held, counted per decision rather than per
+    /// key: two winners for one key are two merges, as they were when each was
+    /// applied on its own.
+    decided: usize,
+    /// Keys the store does not hold yet.
+    new_keys: usize,
+    /// Net change to `data_bytes`, signed because a winner can be smaller than
+    /// what it replaces.
+    bytes_delta: isize,
+}
+
+impl StagedBatch {
+    fn winner(&self, key: &str) -> Option<&Entry> {
+        self.index.get(key).map(|at| &self.winners[*at])
+    }
+
+    /// Record a winner. `replaced` is the size of whatever it displaces, absent
+    /// when the key is new to both the store and this batch.
+    fn stage(&mut self, entry: Entry, replaced: Option<usize>) {
+        self.decided += 1;
+        self.bytes_delta += entry_storage_bytes(&entry) as isize;
+        match replaced {
+            Some(bytes) => self.bytes_delta -= bytes as isize,
+            None => self.new_keys += 1,
+        }
+        match self.index.get(&entry.key) {
+            Some(at) => self.winners[*at] = entry,
+            None => {
+                self.index.insert(entry.key.clone(), self.winners.len());
+                self.winners.push(entry);
+            }
+        }
+    }
+
+    fn into_ops(self) -> Vec<StateOp> {
+        self.winners.into_iter().map(StateOp::Set).collect()
+    }
+}
+
 fn entry_storage_bytes(entry: &Entry) -> usize {
     entry.key.len() + entry.value.as_ref().map_or(0, Vec::len)
 }
@@ -359,17 +416,11 @@ impl NodeState {
             return Ok(());
         }
 
-        if write_to_wal {
-            if let Some(wal) = self.wal.as_mut() {
-                let durable: Vec<StateOp> =
-                    ops.iter().filter(|op| op.is_durable()).cloned().collect();
-                if !durable.is_empty() {
-                    wal.write_ops(&durable)?;
-                    if let Some(tail) = self.wal_tail.as_mut() {
-                        tail.extend(durable);
-                    }
-                }
-            }
+        // Gated on there being a log at all: a memory-only node would otherwise
+        // clone every durable op for `append_durable` to discard.
+        if write_to_wal && self.wal.is_some() {
+            let durable: Vec<StateOp> = ops.iter().filter(|op| op.is_durable()).cloned().collect();
+            self.append_durable(&durable)?;
         }
 
         for op in ops {
@@ -418,7 +469,18 @@ impl NodeState {
     // -----------------------------------------------------------------------
 
     /// Admission checks applied to every entry arriving from a peer (RFC 3.8).
-    fn admit(&self, entry: &Entry, now_ms: i64) -> Admission {
+    /// Admit an entry, charging capacity against what `staged` has already
+    /// decided as well as against what the store holds.
+    ///
+    /// A merge round applies nothing until its whole batch is in the log, so
+    /// without that adjustment one envelope could overshoot `max_keys` and
+    /// `max_total_bytes` by a whole delta. There is exactly one capacity check
+    /// for the same reason it has to be adjusted: a second one against
+    /// unadjusted totals would not be a harmless double-check — a batch that
+    /// shrinks entries near `max_total_bytes` has a *negative* delta, so the
+    /// unadjusted figure is the larger one, and it would reject what this one
+    /// correctly admitted.
+    fn admit(&self, entry: &Entry, now_ms: i64, staged: &StagedBatch) -> Admission {
         if let Admission::Reject { reason } = self.config.limits.check_entry(entry) {
             return Admission::Reject { reason };
         }
@@ -426,12 +488,13 @@ impl NodeState {
             return Admission::Reject { reason };
         }
         // Capacity is only consulted for keys that would be newly created.
-        if !self.core.data().contains_key(&entry.key) {
-            if let Admission::Reject { reason } = self
-                .config
-                .limits
-                .check_capacity(self.core.data().len(), self.data_bytes)
-            {
+        let known =
+            self.core.data().contains_key(&entry.key) || staged.winner(&entry.key).is_some();
+        if !known {
+            if let Admission::Reject { reason } = self.config.limits.check_capacity(
+                self.core.data().len() + staged.new_keys,
+                self.data_bytes.saturating_add_signed(staged.bytes_delta),
+            ) {
                 return Admission::Reject { reason };
             }
         }
@@ -446,46 +509,113 @@ impl NodeState {
     /// Merge one entry under LWW. Returns whether local state changed.
     pub fn sync(&mut self, entry: Entry) -> Result<bool> {
         let now = Utc::now().timestamp_millis();
-        match self.admit(&entry, now) {
-            Admission::Accept => {}
-            Admission::Reject { reason } => {
-                self.entries_rejected += 1;
-                bail!("entry {} rejected: {reason}", entry.key);
-            }
+        if let Admission::Reject { reason } = self.admit(&entry, now, &StagedBatch::default()) {
+            self.entries_rejected += 1;
+            bail!("entry {} rejected: {reason}", entry.key);
         }
 
-        let should_update = match self.core.data().get(&entry.key) {
-            Some(existing) => compare_entries(existing, &entry) == std::cmp::Ordering::Less,
-            None => true,
-        };
-
-        if should_update {
-            self.execute_ops(vec![StateOp::Set(entry)])
-                .context("failed to apply merged entry")?;
-            self.entries_merged += 1;
+        if !beats(self.core.data().get(&entry.key), &entry) {
+            return Ok(false);
         }
-        Ok(should_update)
+        self.execute_ops(vec![StateOp::Set(entry)])
+            .context("failed to apply merged entry")?;
+        self.entries_merged += 1;
+        Ok(true)
     }
 
-    /// Merge a batch. Rule R1: a single failure blocks ack adoption for the whole
-    /// round. Merging is idempotent, so the retry next round costs nothing.
+    /// Merge a batch: decide every entry, append the winners once, then apply.
+    ///
+    /// Rule R1: a single failure blocks ack adoption for the whole round.
+    /// Merging is idempotent, so the retry next round costs nothing.
+    ///
+    /// The three passes are not cosmetic.
+    ///
+    /// Deciding first, against a view of the live map overlaid with what this
+    /// batch has already decided, is what keeps LWW intact: `StateOp::Set`
+    /// applies unconditionally — the comparison lives here — so two versions of
+    /// one key in one envelope must be resolved before either is written, or
+    /// whichever arrived last would win regardless of which one LWW picks.
+    ///
+    /// Appending before applying is what keeps the log ahead of memory. If the
+    /// append fails, nothing has been applied, so the entries are still absent
+    /// and the peer's retransmission decides and appends them again. Applying
+    /// first and appending after cannot recover: the retransmission would find
+    /// the entries already present, decide nothing, append nothing, and report
+    /// the round complete — adopting acks for entries that never reached the
+    /// log. Idempotence, which makes the retry safe, is exactly what makes it
+    /// useless as a repair.
     fn merge_batch(&mut self, entries: Vec<Entry>) -> (usize, usize, bool) {
-        let mut merged = 0usize;
+        let now = Utc::now().timestamp_millis();
         let mut rejected = 0usize;
         let mut complete = true;
+        let mut staged = StagedBatch::default();
+
         for entry in entries {
-            let key = entry.key.clone();
-            match self.sync(entry) {
-                Ok(true) => merged += 1,
-                Ok(false) => {}
-                Err(err) => {
-                    rejected += 1;
-                    complete = false;
-                    warn!("refusing entry {key}: {err:#}");
-                }
+            if let Admission::Reject { reason } = self.admit(&entry, now, &staged) {
+                self.entries_rejected += 1;
+                rejected += 1;
+                complete = false;
+                warn!("refusing entry {}: {reason}", entry.key);
+                continue;
             }
+            let previous = staged
+                .winner(&entry.key)
+                .or_else(|| self.core.data().get(&entry.key));
+            if !beats(previous, &entry) {
+                continue;
+            }
+            let replaced = previous.map(entry_storage_bytes);
+            staged.stage(entry, replaced);
         }
+
+        let merged = staged.decided;
+        let ops = staged.into_ops();
+        if let Err(err) = self.append_durable(&ops) {
+            // Nothing has been applied, so this round changed nothing at all.
+            // Reporting it incomplete parks ack adoption (rule R1); the peer
+            // offers the same entries next round, and because they are still
+            // absent from memory they are decided and appended again.
+            error!("failed to append a merged batch to the WAL: {err:#}");
+            return (0, rejected, false);
+        }
+        if let Err(err) = self.replay_ops(ops) {
+            error!("failed to apply a merged batch: {err:#}");
+            return (0, rejected, false);
+        }
+        self.entries_merged += merged as u64;
+
         (merged, rejected, complete)
+    }
+
+    /// Append durable ops to the log, and to the tail an in-flight snapshot
+    /// will be rebased onto.
+    ///
+    /// Whether the append is forced to disk before returning is the policy in
+    /// [`NodeConfig::wal_sync_interval`]. Either way the bytes reach the kernel
+    /// here, and either way the ops reach `wal_tail`: a rotation must carry
+    /// what the log holds, not what the disk has confirmed.
+    fn append_durable(&mut self, ops: &[StateOp]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let Some(wal) = self.wal.as_mut() else {
+            return Ok(());
+        };
+        wal.write_ops(ops)?;
+        if let Some(tail) = self.wal_tail.as_mut() {
+            tail.extend_from_slice(ops);
+        }
+        Ok(())
+    }
+
+    /// How many times this node's WAL has been forced to disk since it was
+    /// opened, or zero when the node keeps no log.
+    ///
+    /// The cost of a write path is in its fsync count, not in what it returns:
+    /// an embedder can graph this, and a test can pin "one batch, one fsync"
+    /// without timing anything.
+    pub fn wal_sync_count(&self) -> u64 {
+        self.wal.as_ref().map_or(0, |wal| wal.sync_count())
     }
 
     // -----------------------------------------------------------------------
@@ -1199,6 +1329,172 @@ mod persistence_tests {
         );
     }
 
+    fn envelope_from(peer: NodeId, count: u64) -> Vec<Entry> {
+        (0..count)
+            .map(|i| {
+                Entry::new_put(
+                    Metadata::new(peer, i + 1, 1_000),
+                    format!("key-{i}"),
+                    b"value".to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// A round the log refused must leave no trace in memory.
+    ///
+    /// Applying first and appending after looks recoverable — the round reports
+    /// itself incomplete, acks stay parked, the peer retransmits — but it is
+    /// not. The retransmitted entries would compare equal to what is already in
+    /// memory, so the round would decide nothing, append nothing, and report
+    /// itself complete; the acks would then be adopted for entries that never
+    /// reached the log, and the peer would stop offering them. Idempotence is
+    /// what makes the retry safe and what makes it useless as a repair.
+    #[test]
+    fn a_batch_the_log_refused_is_repaired_by_the_retransmission() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+
+        // Break the log: appends fail from here.
+        node.write().wal.as_mut().unwrap().close().unwrap();
+
+        let (merged, rejected, complete) = node.write().merge_batch(envelope_from(2, 10));
+        assert_eq!(
+            (merged, rejected, complete),
+            (0, 0, false),
+            "a round that could not be logged must not report itself complete"
+        );
+        assert!(
+            value_of(&node, "key-0").is_none(),
+            "memory must not run ahead of a log that refused the write"
+        );
+
+        // The peer offers the same entries again, and this time the log takes them.
+        node.write()
+            .wal
+            .as_mut()
+            .unwrap()
+            .replace_with_ops(&[])
+            .unwrap();
+        let (merged, _, complete) = node.write().merge_batch(envelope_from(2, 10));
+        assert_eq!(
+            (merged, complete),
+            (10, true),
+            "the retransmission must be a real merge, not an idempotent no-op"
+        );
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+        for i in 0..10 {
+            assert_eq!(
+                value_of(&reopened, &format!("key-{i}")).as_deref(),
+                Some(b"value".as_ref()),
+                "entry {i} was acknowledged but never made it to the log"
+            );
+        }
+    }
+
+    /// A panic raised by embedder code mid-round must not leave the node in a
+    /// state where later writes are silently not logged.
+    ///
+    /// `admit` calls into an embedder-supplied policy, and `Node::write` hands
+    /// out the lock again after a poisoning panic, so the node keeps serving. A
+    /// round therefore may not park anything in the node that only its own
+    /// normal exit puts back.
+    #[test]
+    fn a_panic_inside_a_round_does_not_wedge_later_writes() {
+        struct Exploding;
+        impl crate::admission::AdmissionPolicy for Exploding {
+            fn admit(&self, _entry: &Entry) -> Admission {
+                panic!("embedder policy panicked");
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![2],
+            dir.path(),
+            NodeConfig {
+                admission: Some(Arc::new(Exploding)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            node.write().merge_batch(envelope_from(2, 4));
+        }));
+        assert!(
+            unwound.is_err(),
+            "the fixture depends on the policy panicking"
+        );
+
+        let before = node.read().wal_sync_count();
+        node.write().put("after".into(), b"1".to_vec()).unwrap();
+        assert_eq!(
+            node.read().wal_sync_count(),
+            before + 1,
+            "a write after the panic was not forced to the log"
+        );
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+        assert_eq!(
+            value_of(&reopened, "after").as_deref(),
+            Some(b"1".as_ref()),
+            "the write that reported success was never durable"
+        );
+    }
+
+    /// The same rotation, but the writes arrive as a merged batch.
+    ///
+    /// A batch defers its append to the end of the round, so it has to feed
+    /// `wal_tail` at that point rather than per entry. If it does not, the
+    /// snapshot rotation replaces the log with a tail that never heard of the
+    /// round, and everything the peer sent while the snapshot was in flight is
+    /// gone at the next restart.
+    #[test]
+    fn a_batch_merged_while_a_snapshot_is_in_flight_survives_the_wal_rotation() {
+        use crate::sync::SyncEnvelope;
+
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+        node.write().put("before".into(), b"1".to_vec()).unwrap();
+
+        let pending = node.write().begin_persist(false).unwrap().unwrap();
+
+        let mut env = SyncEnvelope::new(2, b"uuid-2".to_vec());
+        env.push_only = true;
+        env.entries = (0..10)
+            .map(|i| {
+                Entry::new_put(
+                    Metadata::new(2, i + 1, 1_000),
+                    format!("during-{i}"),
+                    b"2".to_vec(),
+                )
+            })
+            .collect();
+        node.write().merge_push(env).unwrap();
+
+        pending.write().unwrap();
+        node.write().finish_persist(true).unwrap();
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+        assert_eq!(
+            value_of(&reopened, "before").as_deref(),
+            Some(b"1".as_ref())
+        );
+        for i in 0..10 {
+            assert_eq!(
+                value_of(&reopened, &format!("during-{i}")).as_deref(),
+                Some(b"2".as_ref()),
+                "entry {i} was merged during the snapshot and lost in the rotation"
+            );
+        }
+    }
+
     #[test]
     fn a_failed_snapshot_write_leaves_the_wal_authoritative() {
         let dir = tempfile::tempdir().unwrap();
@@ -1227,5 +1523,85 @@ mod persistence_tests {
         assert!(node.write().persist_to_disk().is_err());
         pending.write().unwrap();
         node.write().finish_persist(true).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod batch_admission_tests {
+    use super::*;
+    use crate::admission::Limits;
+
+    fn capped(max_total_bytes: usize) -> Node {
+        Node::with_config(
+            1,
+            vec![2],
+            NodeConfig {
+                limits: Limits {
+                    max_total_bytes,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A peer's entry, stamped now so it wins LWW against a local write made a
+    /// moment ago and still passes the clock-drift check.
+    fn from_peer(seq: u64, key: &str, len: usize) -> Entry {
+        Entry::new_put(
+            Metadata::new(2, seq, Utc::now().timestamp_millis() + 1_000),
+            key.to_string(),
+            vec![0u8; len],
+        )
+    }
+
+    /// A round that frees more than it adds must not be refused for want of the
+    /// room it is about to free.
+    ///
+    /// Capacity is charged against the batch's own net effect, which is negative
+    /// when it shrinks entries. Checking a second time against the store's
+    /// unadjusted total would not be a harmless belt-and-braces: near the cap
+    /// the unadjusted figure is the larger one, so it rejects what the adjusted
+    /// check correctly admitted, and the round is parked until some other write
+    /// happens to shrink the store first.
+    #[test]
+    fn a_batch_that_frees_more_than_it_adds_is_not_refused_for_space() {
+        let node = capped(1_000);
+        // Local writes bypass admission, so the store can start over its cap.
+        node.write().put("big".into(), vec![0u8; 1_200]).unwrap();
+        assert!(node.read().data_bytes > 1_000);
+
+        let (merged, rejected, complete) = node
+            .write()
+            .merge_batch(vec![from_peer(1, "big", 10), from_peer(2, "small", 10)]);
+
+        assert_eq!(
+            (merged, rejected, complete),
+            (2, 0, true),
+            "the new key fits once the batch's own shrink is accounted for"
+        );
+        assert!(node.read().get("small").is_some());
+    }
+
+    /// The adjustment cuts the other way too: a batch may not walk past the cap
+    /// just because every entry in it was judged against the store as it was
+    /// before the round started.
+    #[test]
+    fn a_batch_cannot_overshoot_the_cap_one_entry_at_a_time() {
+        let node = capped(1_000);
+
+        let entries: Vec<Entry> = (0..20)
+            .map(|i| from_peer(i + 1, &format!("k-{i}"), 100))
+            .collect();
+        let (merged, rejected, complete) = node.write().merge_batch(entries);
+
+        assert!(rejected > 0, "the batch was allowed past the cap");
+        assert!(!complete, "a refusal must park ack adoption");
+        assert!(merged < 20);
+        assert!(
+            node.read().data_bytes <= 1_000 + 105,
+            "overshot by more than the entry that crossed the line: {}",
+            node.read().data_bytes
+        );
     }
 }
