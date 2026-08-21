@@ -69,13 +69,15 @@ pub struct WriteAheadLog {
     writer: Option<BufWriter<File>>,
     sequence: u64,
     node_id: NodeId,
-    /// How many times [`Self::write_ops`] has forced the log to disk.
+    /// How many times [`Self::sync`] has forced the log to disk.
     ///
     /// An fsync costs four to five orders of magnitude more than the append it
     /// follows, so how many of them a write path performs is a property worth
     /// asserting rather than timing: a test can pin "one batch, one fsync"
     /// directly, and it stays pinned when someone reshapes the call path.
     syncs: u64,
+    /// Whether an append has landed in the page cache but not yet on disk.
+    unsynced: bool,
 }
 
 impl WriteAheadLog {
@@ -87,6 +89,7 @@ impl WriteAheadLog {
             file_path,
             writer: None,
             syncs: 0,
+            unsynced: false,
             sequence: 0,
             node_id,
         };
@@ -254,6 +257,20 @@ impl WriteAheadLog {
 
     /// Write multiple state operations to the WAL in a single fsync
     pub fn write_ops(&mut self, state_ops: &[StateOp]) -> Result<()> {
+        self.append_ops(state_ops)?;
+        self.sync()
+    }
+
+    /// Hand the ops to the kernel without forcing them to the platter.
+    ///
+    /// The distinction is the whole point of group commit. `write` reaches the
+    /// page cache, which already survives everything that kills only this
+    /// process — a panic, an OOM kill, a restart — and costs about a
+    /// microsecond. `fsync` survives losing the machine, and costs about a
+    /// hundred. Buffering in *user* space would give up the cheap half of that
+    /// guarantee, so the BufWriter is flushed on every append; only the fsync is
+    /// deferred.
+    pub fn append_ops(&mut self, state_ops: &[StateOp]) -> Result<()> {
         if state_ops.is_empty() {
             return Ok(());
         }
@@ -262,6 +279,12 @@ impl WriteAheadLog {
             .writer
             .as_mut()
             .ok_or_else(|| anyhow!("WAL writer not initialized"))?;
+
+        // Marked before the first byte moves, not after the flush succeeds: a
+        // partial write leaves bytes in the file that a later sync still has to
+        // cover. Claiming a debt that turns out not to exist costs one fsync;
+        // missing one loses the bytes.
+        self.unsynced = true;
 
         for state_op in state_ops {
             self.sequence += 1;
@@ -278,19 +301,39 @@ impl WriteAheadLog {
         }
 
         writer.flush()?;
-        writer.get_ref().sync_all()?;
-        self.syncs += 1;
 
         Ok(())
     }
 
-    /// How many times [`Self::write_ops`] has forced this log to disk since it
-    /// was opened.
+    /// Force everything appended so far to disk.
     ///
-    /// Appends only. A rotation ([`Self::replace_with_ops`]) forces the disk
-    /// too — for the replacement file and its directory entry — and is not
-    /// counted here, because what this number exists to explain is the cost a
-    /// write path pays, and a rotation is not on one.
+    /// A no-op when nothing has been appended since the last one, so a periodic
+    /// caller costs nothing on an idle node.
+    pub fn sync(&mut self) -> Result<()> {
+        if !self.unsynced {
+            return Ok(());
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| anyhow!("WAL writer not initialized"))?;
+        writer.get_ref().sync_all()?;
+        self.unsynced = false;
+        self.syncs += 1;
+        Ok(())
+    }
+
+    /// Whether the log holds appends that are not yet on disk.
+    pub fn has_unsynced_appends(&self) -> bool {
+        self.unsynced
+    }
+
+    /// How many times this log has been forced to disk since it was opened.
+    ///
+    /// Appends and closes only. A rotation ([`Self::replace_with_ops`]) forces
+    /// the disk too — for the replacement file and its directory entry — and is
+    /// not counted here, because what this number exists to explain is the cost
+    /// a write path pays, and a rotation is not on one.
     pub fn sync_count(&self) -> u64 {
         self.syncs
     }
@@ -395,7 +438,15 @@ impl WriteAheadLog {
     pub fn close(&mut self) -> Result<()> {
         if let Some(mut writer) = self.writer.take() {
             writer.flush()?;
-            writer.get_ref().sync_all()?;
+            // Closing is a sync point: whatever a deferred policy was still
+            // holding is on disk when this returns. Nothing owed means nothing
+            // to force — a rotation closes a log it has just written and
+            // fsynced, and paying for that twice buys nothing.
+            if self.unsynced {
+                writer.get_ref().sync_all()?;
+                self.unsynced = false;
+                self.syncs += 1;
+            }
             info!("Closed WAL: {:?}", self.file_path);
         }
         Ok(())

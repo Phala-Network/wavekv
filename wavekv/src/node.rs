@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Instant;
 use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn};
 
@@ -99,6 +100,11 @@ pub struct NodeState {
 
     /// Durable ops written after an in-flight snapshot was encoded.
     wal_tail: Option<Vec<StateOp>>,
+
+    /// When the log was last forced to disk, which is where the deferred sync
+    /// window is measured from. Seeded at open, so the first window is a window
+    /// rather than an immediate sync on the first check.
+    wal_synced_at: Instant,
 }
 
 /// A snapshot encoded under the state lock and written after releasing it.
@@ -416,7 +422,9 @@ impl NodeState {
             return Ok(());
         }
 
-        if write_to_wal {
+        // Gated on there being a log at all: a memory-only node would otherwise
+        // clone every durable op for `append_durable` to discard.
+        if write_to_wal && self.wal.is_some() {
             let durable: Vec<StateOp> = ops.iter().filter(|op| op.is_durable()).cloned().collect();
             self.append_durable(&durable)?;
         }
@@ -467,7 +475,20 @@ impl NodeState {
     // -----------------------------------------------------------------------
 
     /// Admission checks applied to every entry arriving from a peer (RFC 3.8).
-    fn admit(&self, entry: &Entry, now_ms: i64) -> Admission {
+    /// Admit an entry, charging capacity against what `staged` has already
+    /// decided as well as against what the store holds.
+    ///
+    /// The adjustment is what keeps a round inside its limits. Nothing is
+    /// applied until the whole batch is in the log, so judging every entry
+    /// against the store as it stood before the round began would let one
+    /// envelope overshoot `max_keys` and `max_total_bytes` by a whole delta.
+    ///
+    /// There is exactly one capacity check. A second one against unadjusted
+    /// totals would not be harmless belt-and-braces: a round that shrinks
+    /// entries has a negative delta, so near `max_total_bytes` the unadjusted
+    /// figure is the larger of the two, and it would reject what this check
+    /// correctly admitted.
+    fn admit(&self, entry: &Entry, now_ms: i64, staged: &StagedBatch) -> Admission {
         if let Admission::Reject { reason } = self.config.limits.check_entry(entry) {
             return Admission::Reject { reason };
         }
@@ -475,12 +496,13 @@ impl NodeState {
             return Admission::Reject { reason };
         }
         // Capacity is only consulted for keys that would be newly created.
-        if !self.core.data().contains_key(&entry.key) {
-            if let Admission::Reject { reason } = self
-                .config
-                .limits
-                .check_capacity(self.core.data().len(), self.data_bytes)
-            {
+        let known =
+            self.core.data().contains_key(&entry.key) || staged.winner(&entry.key).is_some();
+        if !known {
+            if let Admission::Reject { reason } = self.config.limits.check_capacity(
+                self.core.data().len() + staged.new_keys,
+                self.data_bytes.saturating_add_signed(staged.bytes_delta),
+            ) {
                 return Admission::Reject { reason };
             }
         }
@@ -495,7 +517,7 @@ impl NodeState {
     /// Merge one entry under LWW. Returns whether local state changed.
     pub fn sync(&mut self, entry: Entry) -> Result<bool> {
         let now = Utc::now().timestamp_millis();
-        if let Admission::Reject { reason } = self.admit(&entry, now) {
+        if let Admission::Reject { reason } = self.admit(&entry, now, &StagedBatch::default()) {
             self.entries_rejected += 1;
             bail!("entry {} rejected: {reason}", entry.key);
         }
@@ -537,7 +559,7 @@ impl NodeState {
         let mut staged = StagedBatch::default();
 
         for entry in entries {
-            if let Admission::Reject { reason } = self.admit_staged(&entry, now, &staged) {
+            if let Admission::Reject { reason } = self.admit(&entry, now, &staged) {
                 self.entries_rejected += 1;
                 rejected += 1;
                 complete = false;
@@ -573,29 +595,6 @@ impl NodeState {
         (merged, rejected, complete)
     }
 
-    /// Admission for an entry in a batch that has already decided others.
-    ///
-    /// Capacity is charged against what the batch will add, not only against
-    /// what the store already holds. Without that, deferring application to the
-    /// end of the round would let one envelope overshoot `max_keys` and
-    /// `max_total_bytes` by a whole delta.
-    fn admit_staged(&self, entry: &Entry, now_ms: i64, staged: &StagedBatch) -> Admission {
-        let known =
-            self.core.data().contains_key(&entry.key) || staged.winner(&entry.key).is_some();
-        if !known {
-            if let Admission::Reject { reason } = self.config.limits.check_capacity(
-                self.core.data().len() + staged.new_keys,
-                self.data_bytes.saturating_add_signed(staged.bytes_delta),
-            ) {
-                return Admission::Reject { reason };
-            }
-        }
-        // `admit` re-runs the capacity check for a key the store does not hold,
-        // against unadjusted totals; it can only be more permissive than the
-        // check above, which has already passed.
-        self.admit(entry, now_ms)
-    }
-
     /// Append durable ops to the log, and to the tail an in-flight snapshot
     /// will be rebased onto.
     ///
@@ -607,14 +606,68 @@ impl NodeState {
         if ops.is_empty() {
             return Ok(());
         }
+        let deferred = self.config.wal_sync_interval.is_some();
         let Some(wal) = self.wal.as_mut() else {
             return Ok(());
         };
-        wal.write_ops(ops)?;
+        if deferred {
+            wal.append_ops(ops)?;
+        } else {
+            wal.write_ops(ops)?;
+        }
         if let Some(tail) = self.wal_tail.as_mut() {
             tail.extend_from_slice(ops);
         }
         Ok(())
+    }
+
+    /// Force the log to disk if the configured window has elapsed.
+    ///
+    /// Returns whether an fsync happened. Cheap to call often: it does nothing
+    /// when the window is not up, when nothing has been appended since the last
+    /// sync, or when no window is configured at all — in that last case every
+    /// write was already forced before it returned.
+    pub fn sync_wal_if_due(&mut self) -> Result<bool> {
+        let Some(window) = self.config.wal_sync_interval else {
+            return Ok(false);
+        };
+        let now = Instant::now();
+        if !self
+            .wal
+            .as_ref()
+            .is_some_and(|wal| wal.has_unsynced_appends())
+        {
+            // Deliberately does not restart the window. It is measured from the
+            // last fsync, so a write that lands after a quiet stretch is already
+            // due and the next tick forces it — which is the cheapest moment
+            // there is to pay for an fsync, since the node has nothing else to
+            // do. Under load the two are indistinguishable: both settle at one
+            // fsync per window. See the tests either side of this behaviour.
+            return Ok(false);
+        }
+        if now.duration_since(self.wal_synced_at) < window {
+            return Ok(false);
+        }
+        self.sync_wal_now(now)
+    }
+
+    /// Force the log to disk regardless of the window. Use before a planned
+    /// stop, where the next start should see everything this node accepted.
+    pub fn sync_wal(&mut self) -> Result<bool> {
+        self.sync_wal_now(Instant::now())
+    }
+
+    fn sync_wal_now(&mut self, now: Instant) -> Result<bool> {
+        let Some(wal) = self.wal.as_mut() else {
+            return Ok(false);
+        };
+        if !wal.has_unsynced_appends() {
+            self.wal_synced_at = now;
+            return Ok(false);
+        }
+        wal.sync()?;
+        self.wal_synced_at = now;
+        Ok(true)
     }
 
     /// How many times this node's WAL has been forced to disk since it was
@@ -1191,6 +1244,7 @@ impl Node {
             entries_rejected: 0,
             bootstrap_pending: false,
             wal_tail: None,
+            wal_synced_at: Instant::now(),
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -1237,6 +1291,7 @@ impl Node {
             entries_rejected: 0,
             bootstrap_pending: false,
             wal_tail: None,
+            wal_synced_at: Instant::now(),
         };
 
         if state.load_snapshot_if_exists()? {
@@ -1280,6 +1335,27 @@ impl Node {
         self.persist_inner(false)
     }
 
+    /// Force the WAL to disk if [`NodeConfig::wal_sync_interval`] has elapsed.
+    ///
+    /// Call this on a timer at least as often as the configured window; that is
+    /// what makes the window a bound rather than a hope. An append reaches the
+    /// disk within one window plus one tick of that timer. It is a no-op when no
+    /// window is configured, when the window is not up, or when nothing has been
+    /// appended since the last sync, so an idle node costs a lock acquisition.
+    ///
+    /// The fsync runs under the write lock, as every other WAL write does. One
+    /// fsync per window is a duty cycle of about 0.002% at 91 us per 5 s on an
+    /// NVMe host, and about 0.1% at 5 ms — small enough that moving it off the
+    /// lock buys less than the machinery to do so would cost.
+    pub fn sync_wal_if_due(&self) -> Result<bool> {
+        self.write().sync_wal_if_due()
+    }
+
+    /// Force the WAL to disk now. Use before a planned stop.
+    pub fn sync_wal(&self) -> Result<bool> {
+        self.write().sync_wal()
+    }
+
     fn persist_inner(&self, force: bool) -> Result<bool> {
         let _persist = self
             .persist_lock
@@ -1310,6 +1386,7 @@ impl Node {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+    use std::time::Duration;
 
     fn value_of(node: &Node, key: &str) -> Option<Vec<u8>> {
         node.read().get(key).and_then(|entry| entry.value)
@@ -1335,6 +1412,209 @@ mod persistence_tests {
         assert_eq!(
             value_of(&reopened, "during").as_deref(),
             Some(b"2".as_ref())
+        );
+    }
+
+    fn deferred(window: Duration) -> NodeConfig {
+        NodeConfig {
+            wal_sync_interval: Some(window),
+            ..Default::default()
+        }
+    }
+
+    /// The write path stops paying for the disk. What it must not stop doing is
+    /// handing the bytes to the kernel: that is what makes the loss window
+    /// "the machine stopped" rather than "the process stopped".
+    #[test]
+    fn a_deferred_write_reaches_the_file_without_forcing_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![],
+            dir.path(),
+            deferred(Duration::from_secs(5)),
+        )
+        .unwrap();
+        let wal_path = dir.path().join("node_1.wal");
+        let header_len = fs::metadata(&wal_path).unwrap().len();
+
+        for i in 0..10 {
+            node.write()
+                .put(format!("key-{i}"), b"value".to_vec())
+                .unwrap();
+        }
+
+        assert_eq!(
+            node.read().wal_sync_count(),
+            0,
+            "a write inside the window must not fsync"
+        );
+        assert!(
+            fs::metadata(&wal_path).unwrap().len() > header_len,
+            "the appends never left user space, so a process crash would lose them"
+        );
+    }
+
+    /// The window is only a bound if something acts on it.
+    #[test]
+    fn the_window_forces_the_log_once_it_elapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![],
+            dir.path(),
+            deferred(Duration::from_millis(1)),
+        )
+        .unwrap();
+
+        node.write().put("k".into(), b"v".to_vec()).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert!(node.sync_wal_if_due().unwrap(), "the window had elapsed");
+        assert_eq!(node.read().wal_sync_count(), 1);
+        assert!(
+            !node.sync_wal_if_due().unwrap(),
+            "a second call with nothing appended must not fsync again"
+        );
+        assert_eq!(node.read().wal_sync_count(), 1);
+    }
+
+    /// A node that is still inside its window has to be able to stop cleanly.
+    #[test]
+    fn an_explicit_sync_does_not_wait_for_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![],
+            dir.path(),
+            deferred(Duration::from_secs(60)),
+        )
+        .unwrap();
+
+        node.write().put("k".into(), b"v".to_vec()).unwrap();
+        assert!(
+            !node.sync_wal_if_due().unwrap(),
+            "the fixture depends on the window still being open"
+        );
+        assert!(node.sync_wal().unwrap());
+        assert_eq!(node.read().wal_sync_count(), 1);
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        assert_eq!(value_of(&reopened, "k").as_deref(), Some(b"v".as_ref()));
+    }
+
+    /// The default is unchanged: every write is on the disk before it returns.
+    #[test]
+    fn without_a_window_every_write_is_forced_before_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+
+        for i in 0..3 {
+            node.write().put(format!("key-{i}"), b"v".to_vec()).unwrap();
+        }
+
+        assert_eq!(node.read().wal_sync_count(), 3);
+        assert!(
+            !node.sync_wal_if_due().unwrap(),
+            "with no window configured there is never anything owing"
+        );
+    }
+
+    /// An idle node does not hoard its next write for a whole window.
+    ///
+    /// The window bounds what a crash can lose, not how long a write waits. It
+    /// is measured from the last fsync rather than restarted at every tick that
+    /// finds nothing owed, so a write landing after a quiet stretch is already
+    /// due and goes to disk on the next tick — the cheapest moment there is to
+    /// spend one, with the node otherwise idle. Restarting the window there
+    /// would delay that write by a full window to save an fsync the node could
+    /// easily afford, and would change nothing under load, where both settle at
+    /// one fsync per window.
+    #[test]
+    fn an_idle_node_makes_its_next_write_durable_at_the_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let window = Duration::from_millis(50);
+        let node =
+            Node::with_persistence_and_config(1, vec![], dir.path(), deferred(window)).unwrap();
+
+        std::thread::sleep(window * 2);
+        assert!(
+            !node.sync_wal_if_due().unwrap(),
+            "an idle node has nothing to force"
+        );
+
+        node.write().put("k".into(), b"v".to_vec()).unwrap();
+        assert!(
+            node.sync_wal_if_due().unwrap(),
+            "a write after a quiet stretch is already due, not the start of a new window"
+        );
+        assert_eq!(node.read().wal_sync_count(), 1);
+    }
+
+    /// Under load the window does its job: a burst inside one window costs one
+    /// fsync, not one per write.
+    ///
+    /// The window here is long enough that no plausible scheduling delay can
+    /// end it mid-test — the property is "not yet due", and a stalled runner
+    /// must not be able to turn that into a failure. `sync_wal` then proves the
+    /// writes really were owed rather than already on disk.
+    #[test]
+    fn writes_inside_one_window_share_a_single_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![],
+            dir.path(),
+            deferred(Duration::from_secs(3_600)),
+        )
+        .unwrap();
+
+        for i in 0..20 {
+            node.write().put(format!("k-{i}"), b"v".to_vec()).unwrap();
+            assert!(!node.sync_wal_if_due().unwrap());
+        }
+        assert_eq!(
+            node.read().wal_sync_count(),
+            0,
+            "a burst inside one window must not pay per write"
+        );
+
+        assert!(node.sync_wal().unwrap(), "the burst was owed to the disk");
+        assert_eq!(node.read().wal_sync_count(), 1);
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        for i in 0..20 {
+            assert_eq!(
+                value_of(&reopened, &format!("k-{i}")).as_deref(),
+                Some(b"v".as_ref())
+            );
+        }
+    }
+
+    /// A snapshot rotation is a sync point of its own, and it must not leave the
+    /// new log believing it still owes the disk an fsync it already did.
+    #[test]
+    fn a_rotation_clears_what_the_window_was_holding() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![],
+            dir.path(),
+            deferred(Duration::from_secs(60)),
+        )
+        .unwrap();
+
+        node.write().put("before".into(), b"1".to_vec()).unwrap();
+        node.persist().unwrap();
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        assert_eq!(
+            value_of(&reopened, "before").as_deref(),
+            Some(b"1".as_ref()),
+            "a write held by the window was lost when the snapshot rotated the log"
         );
     }
 
@@ -1532,5 +1812,85 @@ mod persistence_tests {
         assert!(node.write().persist_to_disk().is_err());
         pending.write().unwrap();
         node.write().finish_persist(true).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod batch_admission_tests {
+    use super::*;
+    use crate::admission::Limits;
+
+    fn capped(max_total_bytes: usize) -> Node {
+        Node::with_config(
+            1,
+            vec![2],
+            NodeConfig {
+                limits: Limits {
+                    max_total_bytes,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A peer's entry, stamped now so it wins LWW against a local write made a
+    /// moment ago and still passes the clock-drift check.
+    fn from_peer(seq: u64, key: &str, len: usize) -> Entry {
+        Entry::new_put(
+            Metadata::new(2, seq, Utc::now().timestamp_millis() + 1_000),
+            key.to_string(),
+            vec![0u8; len],
+        )
+    }
+
+    /// A round that frees more than it adds must not be refused for want of the
+    /// room it is about to free.
+    ///
+    /// Capacity is charged against the batch's own net effect, which is negative
+    /// when it shrinks entries. Checking a second time against the store's
+    /// unadjusted total would not be a harmless belt-and-braces: near the cap
+    /// the unadjusted figure is the larger one, so it rejects what the adjusted
+    /// check correctly admitted, and the round is parked until some other write
+    /// happens to shrink the store first.
+    #[test]
+    fn a_batch_that_frees_more_than_it_adds_is_not_refused_for_space() {
+        let node = capped(1_000);
+        // Local writes bypass admission, so the store can start over its cap.
+        node.write().put("big".into(), vec![0u8; 1_200]).unwrap();
+        assert!(node.read().data_bytes > 1_000);
+
+        let (merged, rejected, complete) = node
+            .write()
+            .merge_batch(vec![from_peer(1, "big", 10), from_peer(2, "small", 10)]);
+
+        assert_eq!(
+            (merged, rejected, complete),
+            (2, 0, true),
+            "the new key fits once the batch's own shrink is accounted for"
+        );
+        assert!(node.read().get("small").is_some());
+    }
+
+    /// The adjustment cuts the other way too: a batch may not walk past the cap
+    /// just because every entry in it was judged against the store as it was
+    /// before the round started.
+    #[test]
+    fn a_batch_cannot_overshoot_the_cap_one_entry_at_a_time() {
+        let node = capped(1_000);
+
+        let entries: Vec<Entry> = (0..20)
+            .map(|i| from_peer(i + 1, &format!("k-{i}"), 100))
+            .collect();
+        let (merged, rejected, complete) = node.write().merge_batch(entries);
+
+        assert!(rejected > 0, "the batch was allowed past the cap");
+        assert!(!complete, "a refusal must park ack adoption");
+        assert!(merged < 20);
+        assert!(
+            node.read().data_bytes <= 1_000 + 105,
+            "overshot by more than the entry that crossed the line: {}",
+            node.read().data_bytes
+        );
     }
 }
