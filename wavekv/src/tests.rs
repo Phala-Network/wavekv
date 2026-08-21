@@ -2522,3 +2522,135 @@ async fn a_round_that_only_retransmitted_is_not_counted_as_quiescent() {
         "the peer retransmitted an entry we already held; that is not a quiescent round"
     );
 }
+
+/// A merge round appends once.
+///
+/// `write_ops` fsyncs, and an fsync is four to five orders of magnitude dearer
+/// than the append it follows: 91 us against 1 us on an NVMe ext4 host, and
+/// milliseconds on the virtio disk a CVM actually gets. Appending per entry made
+/// a catch-up of N entries cost N fsyncs, serially, under this node's write
+/// lock — so a node rejoining a cluster stalled every reader for as long as it
+/// took to write the backlog one record at a time.
+#[tokio::test]
+async fn a_merged_batch_is_appended_to_the_wal_once() {
+    use crate::sync::SyncEnvelope;
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+
+    let before = node.read().wal_sync_count();
+    let mut env = SyncEnvelope::new(2, uuid_for(2));
+    env.push_only = true;
+    env.entries = (0..200)
+        .map(|i| {
+            Entry::new_put(
+                Metadata::new(2, i + 1, 1_000),
+                format!("key-{i}"),
+                b"value".to_vec(),
+            )
+        })
+        .collect();
+    node.write().merge_push(env).unwrap();
+
+    assert_eq!(
+        node.read().wal_sync_count() - before,
+        1,
+        "200 merged entries must cost one fsync, not one each"
+    );
+    assert_eq!(node.read().get("key-199").unwrap().value.unwrap(), b"value");
+}
+
+/// The batch defers the append; it must not lose it. Everything the round
+/// merged has to survive a restart that has only the log to read.
+#[tokio::test]
+async fn a_batch_deferred_append_still_reaches_the_log() {
+    use crate::sync::SyncEnvelope;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let node = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+        let mut env = SyncEnvelope::new(2, uuid_for(2));
+        env.push_only = true;
+        env.entries = (0..50)
+            .map(|i| {
+                Entry::new_put(
+                    Metadata::new(2, i + 1, 1_000),
+                    format!("key-{i}"),
+                    format!("value-{i}").into_bytes(),
+                )
+            })
+            .collect();
+        node.write().merge_push(env).unwrap();
+        // No snapshot: the WAL is the only record of the round.
+    }
+
+    let recovered = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+    for i in 0..50 {
+        assert_eq!(
+            recovered
+                .read()
+                .get(&format!("key-{i}"))
+                .and_then(|entry| entry.value),
+            Some(format!("value-{i}").into_bytes()),
+            "entry {i} was merged but never made it to the log"
+        );
+    }
+}
+
+/// Two entries for the same key in one batch still resolve by LWW.
+///
+/// This is why the batch defers only the append. `StateOp::Set` applies
+/// unconditionally — the comparison lives in `sync`, against the live map — so a
+/// batch that decided every entry up front and applied them afterwards would let
+/// whichever entry came last win, regardless of which one LWW picks.
+#[tokio::test]
+async fn a_batch_holding_two_versions_of_a_key_keeps_the_later_one() {
+    use crate::sync::SyncEnvelope;
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::new_with_persistence(1, vec![2, 3], dir.path()).unwrap();
+
+    let mut env = SyncEnvelope::new(2, uuid_for(2));
+    env.push_only = true;
+    env.entries = vec![
+        Entry::new_put(Metadata::new(2, 1, 2_000), "k".into(), b"newer".to_vec()),
+        Entry::new_put(Metadata::new(3, 1, 1_000), "k".into(), b"older".to_vec()),
+    ];
+    node.write().merge_push(env).unwrap();
+
+    assert_eq!(
+        node.read().get("k").unwrap().value.unwrap(),
+        b"newer",
+        "the batch applied the loser after the winner"
+    );
+
+    // And the same holds across a restart, so the log agrees with memory.
+    drop(node);
+    let recovered = Node::new_with_persistence(1, vec![2, 3], dir.path()).unwrap();
+    assert_eq!(recovered.read().get("k").unwrap().value.unwrap(), b"newer");
+}
+
+/// A single `sync` outside a batch keeps appending immediately: the deferral is
+/// scoped to a merge round, not a new default for every write.
+#[tokio::test]
+async fn a_write_outside_a_batch_is_appended_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::new_with_persistence(1, vec![2], dir.path()).unwrap();
+
+    let before = node.read().wal_sync_count();
+    node.write().put("a".to_string(), b"1".to_vec()).unwrap();
+    node.write().put("b".to_string(), b"2".to_vec()).unwrap();
+    node.write()
+        .sync(Entry::new_put(
+            Metadata::new(2, 1, 1_000),
+            "c".into(),
+            b"3".to_vec(),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        node.read().wal_sync_count() - before,
+        3,
+        "writes outside a merge round must each be durable when they return"
+    );
+}
