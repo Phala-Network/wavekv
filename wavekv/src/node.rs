@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Instant;
 use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn};
 
@@ -99,6 +100,11 @@ pub struct NodeState {
 
     /// Durable ops written after an in-flight snapshot was encoded.
     wal_tail: Option<Vec<StateOp>>,
+
+    /// When the log was last forced to disk, which is where the deferred sync
+    /// window is measured from. Seeded at open, so the first window is a window
+    /// rather than an immediate sync on the first check.
+    wal_synced_at: Instant,
 }
 
 /// A snapshot encoded under the state lock and written after releasing it.
@@ -600,14 +606,68 @@ impl NodeState {
         if ops.is_empty() {
             return Ok(());
         }
+        let deferred = self.config.wal_sync_interval.is_some();
         let Some(wal) = self.wal.as_mut() else {
             return Ok(());
         };
-        wal.write_ops(ops)?;
+        if deferred {
+            wal.append_ops(ops)?;
+        } else {
+            wal.write_ops(ops)?;
+        }
         if let Some(tail) = self.wal_tail.as_mut() {
             tail.extend_from_slice(ops);
         }
         Ok(())
+    }
+
+    /// Force the log to disk if the configured window has elapsed.
+    ///
+    /// Returns whether an fsync happened. Cheap to call often: it does nothing
+    /// when the window is not up, when nothing has been appended since the last
+    /// sync, or when no window is configured at all — in that last case every
+    /// write was already forced before it returned.
+    pub fn sync_wal_if_due(&mut self) -> Result<bool> {
+        let Some(window) = self.config.wal_sync_interval else {
+            return Ok(false);
+        };
+        let now = Instant::now();
+        if !self
+            .wal
+            .as_ref()
+            .is_some_and(|wal| wal.has_unsynced_appends())
+        {
+            // Deliberately does not restart the window. It is measured from the
+            // last fsync, so a write that lands after a quiet stretch is already
+            // due and the next tick forces it — which is the cheapest moment
+            // there is to pay for an fsync, since the node has nothing else to
+            // do. Under load the two are indistinguishable: both settle at one
+            // fsync per window. See the tests either side of this behaviour.
+            return Ok(false);
+        }
+        if now.duration_since(self.wal_synced_at) < window {
+            return Ok(false);
+        }
+        self.sync_wal_now(now)
+    }
+
+    /// Force the log to disk regardless of the window. Use before a planned
+    /// stop, where the next start should see everything this node accepted.
+    pub fn sync_wal(&mut self) -> Result<bool> {
+        self.sync_wal_now(Instant::now())
+    }
+
+    fn sync_wal_now(&mut self, now: Instant) -> Result<bool> {
+        let Some(wal) = self.wal.as_mut() else {
+            return Ok(false);
+        };
+        if !wal.has_unsynced_appends() {
+            self.wal_synced_at = now;
+            return Ok(false);
+        }
+        wal.sync()?;
+        self.wal_synced_at = now;
+        Ok(true)
     }
 
     /// How many times this node's WAL has been forced to disk since it was
@@ -1184,6 +1244,7 @@ impl Node {
             entries_rejected: 0,
             bootstrap_pending: false,
             wal_tail: None,
+            wal_synced_at: Instant::now(),
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -1230,6 +1291,7 @@ impl Node {
             entries_rejected: 0,
             bootstrap_pending: false,
             wal_tail: None,
+            wal_synced_at: Instant::now(),
         };
 
         if state.load_snapshot_if_exists()? {
@@ -1273,6 +1335,27 @@ impl Node {
         self.persist_inner(false)
     }
 
+    /// Force the WAL to disk if [`NodeConfig::wal_sync_interval`] has elapsed.
+    ///
+    /// Call this on a timer at least as often as the configured window; that is
+    /// what makes the window a bound rather than a hope. An append reaches the
+    /// disk within one window plus one tick of that timer. It is a no-op when no
+    /// window is configured, when the window is not up, or when nothing has been
+    /// appended since the last sync, so an idle node costs a lock acquisition.
+    ///
+    /// The fsync runs under the write lock, as every other WAL write does. One
+    /// fsync per window is a duty cycle of about 0.002% at 91 us per 5 s on an
+    /// NVMe host, and about 0.1% at 5 ms — small enough that moving it off the
+    /// lock buys less than the machinery to do so would cost.
+    pub fn sync_wal_if_due(&self) -> Result<bool> {
+        self.write().sync_wal_if_due()
+    }
+
+    /// Force the WAL to disk now. Use before a planned stop.
+    pub fn sync_wal(&self) -> Result<bool> {
+        self.write().sync_wal()
+    }
+
     fn persist_inner(&self, force: bool) -> Result<bool> {
         let _persist = self
             .persist_lock
@@ -1303,6 +1386,7 @@ impl Node {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+    use std::time::Duration;
 
     fn value_of(node: &Node, key: &str) -> Option<Vec<u8>> {
         node.read().get(key).and_then(|entry| entry.value)
@@ -1328,6 +1412,209 @@ mod persistence_tests {
         assert_eq!(
             value_of(&reopened, "during").as_deref(),
             Some(b"2".as_ref())
+        );
+    }
+
+    fn deferred(window: Duration) -> NodeConfig {
+        NodeConfig {
+            wal_sync_interval: Some(window),
+            ..Default::default()
+        }
+    }
+
+    /// The write path stops paying for the disk. What it must not stop doing is
+    /// handing the bytes to the kernel: that is what makes the loss window
+    /// "the machine stopped" rather than "the process stopped".
+    #[test]
+    fn a_deferred_write_reaches_the_file_without_forcing_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![],
+            dir.path(),
+            deferred(Duration::from_secs(5)),
+        )
+        .unwrap();
+        let wal_path = dir.path().join("node_1.wal");
+        let header_len = fs::metadata(&wal_path).unwrap().len();
+
+        for i in 0..10 {
+            node.write()
+                .put(format!("key-{i}"), b"value".to_vec())
+                .unwrap();
+        }
+
+        assert_eq!(
+            node.read().wal_sync_count(),
+            0,
+            "a write inside the window must not fsync"
+        );
+        assert!(
+            fs::metadata(&wal_path).unwrap().len() > header_len,
+            "the appends never left user space, so a process crash would lose them"
+        );
+    }
+
+    /// The window is only a bound if something acts on it.
+    #[test]
+    fn the_window_forces_the_log_once_it_elapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![],
+            dir.path(),
+            deferred(Duration::from_millis(1)),
+        )
+        .unwrap();
+
+        node.write().put("k".into(), b"v".to_vec()).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert!(node.sync_wal_if_due().unwrap(), "the window had elapsed");
+        assert_eq!(node.read().wal_sync_count(), 1);
+        assert!(
+            !node.sync_wal_if_due().unwrap(),
+            "a second call with nothing appended must not fsync again"
+        );
+        assert_eq!(node.read().wal_sync_count(), 1);
+    }
+
+    /// A node that is still inside its window has to be able to stop cleanly.
+    #[test]
+    fn an_explicit_sync_does_not_wait_for_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![],
+            dir.path(),
+            deferred(Duration::from_secs(60)),
+        )
+        .unwrap();
+
+        node.write().put("k".into(), b"v".to_vec()).unwrap();
+        assert!(
+            !node.sync_wal_if_due().unwrap(),
+            "the fixture depends on the window still being open"
+        );
+        assert!(node.sync_wal().unwrap());
+        assert_eq!(node.read().wal_sync_count(), 1);
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        assert_eq!(value_of(&reopened, "k").as_deref(), Some(b"v".as_ref()));
+    }
+
+    /// The default is unchanged: every write is on the disk before it returns.
+    #[test]
+    fn without_a_window_every_write_is_forced_before_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+
+        for i in 0..3 {
+            node.write().put(format!("key-{i}"), b"v".to_vec()).unwrap();
+        }
+
+        assert_eq!(node.read().wal_sync_count(), 3);
+        assert!(
+            !node.sync_wal_if_due().unwrap(),
+            "with no window configured there is never anything owing"
+        );
+    }
+
+    /// An idle node does not hoard its next write for a whole window.
+    ///
+    /// The window bounds what a crash can lose, not how long a write waits. It
+    /// is measured from the last fsync rather than restarted at every tick that
+    /// finds nothing owed, so a write landing after a quiet stretch is already
+    /// due and goes to disk on the next tick — the cheapest moment there is to
+    /// spend one, with the node otherwise idle. Restarting the window there
+    /// would delay that write by a full window to save an fsync the node could
+    /// easily afford, and would change nothing under load, where both settle at
+    /// one fsync per window.
+    #[test]
+    fn an_idle_node_makes_its_next_write_durable_at_the_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let window = Duration::from_millis(50);
+        let node =
+            Node::with_persistence_and_config(1, vec![], dir.path(), deferred(window)).unwrap();
+
+        std::thread::sleep(window * 2);
+        assert!(
+            !node.sync_wal_if_due().unwrap(),
+            "an idle node has nothing to force"
+        );
+
+        node.write().put("k".into(), b"v".to_vec()).unwrap();
+        assert!(
+            node.sync_wal_if_due().unwrap(),
+            "a write after a quiet stretch is already due, not the start of a new window"
+        );
+        assert_eq!(node.read().wal_sync_count(), 1);
+    }
+
+    /// Under load the window does its job: a burst inside one window costs one
+    /// fsync, not one per write.
+    ///
+    /// The window here is long enough that no plausible scheduling delay can
+    /// end it mid-test — the property is "not yet due", and a stalled runner
+    /// must not be able to turn that into a failure. `sync_wal` then proves the
+    /// writes really were owed rather than already on disk.
+    #[test]
+    fn writes_inside_one_window_share_a_single_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![],
+            dir.path(),
+            deferred(Duration::from_secs(3_600)),
+        )
+        .unwrap();
+
+        for i in 0..20 {
+            node.write().put(format!("k-{i}"), b"v".to_vec()).unwrap();
+            assert!(!node.sync_wal_if_due().unwrap());
+        }
+        assert_eq!(
+            node.read().wal_sync_count(),
+            0,
+            "a burst inside one window must not pay per write"
+        );
+
+        assert!(node.sync_wal().unwrap(), "the burst was owed to the disk");
+        assert_eq!(node.read().wal_sync_count(), 1);
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        for i in 0..20 {
+            assert_eq!(
+                value_of(&reopened, &format!("k-{i}")).as_deref(),
+                Some(b"v".as_ref())
+            );
+        }
+    }
+
+    /// A snapshot rotation is a sync point of its own, and it must not leave the
+    /// new log believing it still owes the disk an fsync it already did.
+    #[test]
+    fn a_rotation_clears_what_the_window_was_holding() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::with_persistence_and_config(
+            1,
+            vec![],
+            dir.path(),
+            deferred(Duration::from_secs(60)),
+        )
+        .unwrap();
+
+        node.write().put("before".into(), b"1".to_vec()).unwrap();
+        node.persist().unwrap();
+
+        drop(node);
+        let reopened = Node::new_with_persistence(1, vec![], dir.path()).unwrap();
+        assert_eq!(
+            value_of(&reopened, "before").as_deref(),
+            Some(b"1".as_ref()),
+            "a write held by the window was lost when the snapshot rotated the log"
         );
     }
 

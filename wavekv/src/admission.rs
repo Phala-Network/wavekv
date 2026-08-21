@@ -118,6 +118,21 @@ pub struct NodeConfig {
     pub coalesce_window: Option<Duration>,
     pub max_delta_entries: usize,
     pub max_delta_bytes: usize,
+    /// How long a write may sit in the page cache before the log is forced to
+    /// disk. `None` — the default — forces it before every write returns.
+    ///
+    /// An fsync costs about a hundred microseconds on an NVMe host and
+    /// milliseconds on the virtio disk a guest gets, and it runs under this
+    /// node's write lock, so paying it per write bounds how fast the node can
+    /// accept anything and stalls its readers while it does. Setting a window
+    /// trades that for a bounded loss: writes made in the last window are lost
+    /// if the *machine* stops, and are not lost if only the process does — the
+    /// bytes are in the kernel either way.
+    ///
+    /// The embedder must call [`Node::sync_wal_if_due`](crate::Node::sync_wal_if_due)
+    /// on a timer for the window to mean anything. Nothing else forces the log
+    /// on a schedule; a snapshot does, but that is minutes apart, not seconds.
+    pub wal_sync_interval: Option<Duration>,
 }
 
 impl Default for NodeConfig {
@@ -128,6 +143,7 @@ impl Default for NodeConfig {
             coalesce_window: Some(Duration::from_millis(200)),
             max_delta_entries: 4096,
             max_delta_bytes: 4 * 1024 * 1024,
+            wal_sync_interval: None,
         }
     }
 }
@@ -140,6 +156,7 @@ impl std::fmt::Debug for NodeConfig {
             .field("coalesce_window", &self.coalesce_window)
             .field("max_delta_entries", &self.max_delta_entries)
             .field("max_delta_bytes", &self.max_delta_bytes)
+            .field("wal_sync_interval", &self.wal_sync_interval)
             .finish()
     }
 }
