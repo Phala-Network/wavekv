@@ -8,8 +8,9 @@ Models:
   map overlaid with `StagedBatch`, then apply the winners as `StateOp::Set`),
   `StagedBatch::{winner, stage, into_ops}`, `NodeState::admit`.
 * `wavekv/src/admission.rs`: `Limits::check_clock`.
-* `wavekv/src/node.rs`: `NodeState::put` / `NodeState::delete` (an unconditional
-  `StateOp::Set` of a freshly stamped entry).
+* `wavekv/src/node.rs`: `NodeState::alloc_entry_meta(key)`, `NodeState::put` /
+  `NodeState::delete` (a `StateOp::Set` of an entry stamped
+  `max(now, existing.timestamp + 1)`), as of wavekv 2.2.0.
 
 Proven:
 * `mergeBatch_eq`: the three-pass staged batch equals merging its admitted entries one
@@ -22,16 +23,18 @@ Proven:
   recovery: once every replica's clock has passed `timestamp - drift` for every entry,
   admission is the identity and convergence holds again (R1 retransmission makes the
   rejected entry arrive again).
-* `local_write_diverges`: `put`/`delete` do not go through `beats`. A local write whose
-  wall-clock stamp is below the held entry's (a peer clock that runs ahead, within
-  `max_clock_drift`) is visible locally but loses on every peer, so the replicas differ
-  although both hold the same two entries. `local_write_eq_apply` gives the condition
-  under which a local write is a merge.
+* `stamped_beats`, `localWrite_stamped_eq_apply`: a local write always beats the held
+  entry, so writing it unconditionally is the same as merging it.
+  `runEvents_eq_applyList` and `convergence_with_local_writes`: a replica's state is
+  the LWW merge of everything it received or wrote, so replicas that saw the same
+  entries agree. `clock_skew_scenario_converges`: the clock-skew case that diverged
+  before 2.2.0 now converges.
 
 Modeling gap: `admit` also consults `check_capacity`, which depends on the store size
 and on the staged batch; it is not entry-only, is not modeled, and is a further source
 of order dependence (a full replica refuses a new key that another accepts). The Rust
-`saturating_sub` in `check_clock` is plain `Int` subtraction here. Durability (WAL
+`saturating_sub` in `check_clock` and `saturating_add` in `alloc_entry_meta` are plain
+`Int` arithmetic here. Durability (WAL
 append) is omitted.
 -/
 
@@ -244,33 +247,101 @@ theorem convergence_clock_caught_up (drift now₁ now₂ : Int) (s : State)
   rw [f₁, f₂]
   exact convergence _ _ _ hset hcoh
 
-/-! ## Local writes bypass `beats` -/
+/-! ## Local writes -/
 
-/-- `node.rs: NodeState::put` / `delete`: `StateOp::Set` of the freshly stamped entry,
-with no `beats` check against what is held. -/
+/-- `node.rs: NodeState::alloc_entry_meta(key)`: the timestamp is local wall time, raised
+to one past the held entry's timestamp when the key is held. -/
+def allocStamp (now : Int) (s : State) (k : Key) : Int :=
+  match s k with
+  | some e => max now (e.metadata.timestamp + 1)
+  | none => now
+
+/-- The entry `put` (`val = some _`) or `delete` (`val = none`) creates. -/
+def stamped (s : State) (node seq : Nat) (now : Int) (k : Key) (val : Option Value) : Entry :=
+  ⟨k, val, ⟨node, seq, allocStamp now s k⟩⟩
+
+/-- `node.rs: NodeState::put` / `delete`: `StateOp::Set` of the stamped entry. -/
 def localWrite (s : State) (e : Entry) : State := setEntry s e
+
+theorem stamped_gt (s : State) (node seq : Nat) (now : Int) (k : Key) (val : Option Value)
+    (x : Entry) (hx : s k = some x) :
+    x.metadata < (stamped s node seq now k val).metadata := by
+  rw [Metadata.lt_iff]; left
+  simp only [stamped, allocStamp, hx]; omega
+
+theorem stamped_beats (s : State) (node seq : Nat) (now : Int) (k : Key) (val : Option Value) :
+    beats (s k) (stamped s node seq now k val) = true := by
+  cases hx : s k with
+  | none => rfl
+  | some x => simpa [beats] using stamped_gt s node seq now k val x hx
 
 /-- A local write is a merge exactly when its stamp beats the held entry. -/
 theorem local_write_eq_apply (s : State) (e : Entry) (h : beats (s e.key) e = true) :
     localWrite s e = apply s e := by simp [localWrite, apply, h]
 
+/-- With 2.2.0 stamping, every local write is a merge. -/
+theorem localWrite_stamped_eq_apply (s : State) (node seq : Nat) (now : Int) (k : Key)
+    (val : Option Value) :
+    localWrite s (stamped s node seq now k val) = apply s (stamped s node seq now k val) :=
+  local_write_eq_apply _ _ (stamped_beats s node seq now k val)
+
+/-- What a replica does: merge a received entry, or write locally. -/
+inductive Event
+  | recv (e : Entry)
+  | write (node seq : Nat) (now : Int) (k : Key) (val : Option Value)
+
+/-- Apply one event; the second component logs every entry the replica has seen. -/
+def stepEvent (p : State × List Entry) : Event → State × List Entry
+  | .recv e => (apply p.1 e, p.2 ++ [e])
+  | .write node seq now k val =>
+    let e := stamped p.1 node seq now k val
+    (localWrite p.1 e, p.2 ++ [e])
+
+def runEvents (s : State) (evs : List Event) : State × List Entry := evs.foldl stepEvent (s, [])
+
+theorem foldl_stepEvent (s : State) (evs : List Event) (p : State × List Entry)
+    (hp : p.1 = applyList s p.2) :
+    (evs.foldl stepEvent p).1 = applyList s (evs.foldl stepEvent p).2 := by
+  induction evs generalizing p with
+  | nil => exact hp
+  | cons ev evs ih =>
+    apply ih
+    cases ev with
+    | recv e =>
+      simp only [stepEvent, applyList, List.foldl_append, List.foldl_cons, List.foldl_nil]
+      rw [← applyList, ← hp]
+    | write node seq now k val =>
+      simp only [stepEvent, localWrite_stamped_eq_apply, applyList, List.foldl_append,
+        List.foldl_cons, List.foldl_nil]
+      rw [← applyList, ← hp]
+
+/-- A replica's state is the LWW merge of every entry it received or wrote. -/
+theorem runEvents_eq_applyList (s : State) (evs : List Event) :
+    (runEvents s evs).1 = applyList s (runEvents s evs).2 :=
+  foldl_stepEvent s evs (s, []) rfl
+
+/-- **Convergence with local writes.** Two replicas whose histories (receives and
+local writes, interleaved in any way) produced the same set of entries are equal. -/
+theorem convergence_with_local_writes (s : State) (evs₁ evs₂ : List Event)
+    (hset : ∀ e, e ∈ (runEvents s evs₁).2 ↔ e ∈ (runEvents s evs₂).2)
+    (hcoh : BatchCoherent s (runEvents s evs₁).2) :
+    (runEvents s evs₁).1 = (runEvents s evs₂).1 := by
+  rw [runEvents_eq_applyList, runEvents_eq_applyList]
+  exact convergence _ _ _ hset hcoh
+
 /-- Entry authored by node 2, whose clock runs 10 ms ahead of node 1's. -/
 def aheadWrite : Entry := ⟨"k", some [1], ⟨2, 1, 1000⟩⟩
-/-- Node 1 then deletes `k`; its wall clock reads 990. -/
-def behindDelete : Entry := ⟨"k", none, ⟨1, 1, 990⟩⟩
 
-/-- **Counterexample.** Node 1 merges `aheadWrite` and then deletes the key locally;
-node 2 wrote `aheadWrite` and merges node 1's tombstone. Both hold the same two entries,
-node 1 reports the key deleted, node 2 reports it live, and LWW over the two entries
-(`applyList`, either order) says live. A later re-merge of `aheadWrite` on node 1 (the
-digest repair path) brings the deleted key back. -/
-theorem local_write_diverges :
-    let node1 := localWrite (applyList State.empty [aheadWrite]) behindDelete
-    let node2 := applyList (localWrite State.empty aheadWrite) [behindDelete]
-    node1 "k" = some behindDelete ∧ node2 "k" = some aheadWrite ∧
-    applyList State.empty [aheadWrite, behindDelete] "k" = some aheadWrite ∧
-    applyList State.empty [behindDelete, aheadWrite] "k" = some aheadWrite ∧
-    apply node1 aheadWrite "k" = some aheadWrite := by
+/-- The clock-skew scenario that diverged before 2.2.0 (local delete stamped below the
+held entry). Node 1 merges `aheadWrite`, then deletes `k` with its clock at 990; the
+tombstone is stamped 1001 and wins. Node 2 wrote `aheadWrite` and merges the tombstone.
+Both report the key deleted. -/
+theorem clock_skew_scenario_converges :
+    let node1 := runEvents State.empty [.recv aheadWrite, .write 1 1 990 "k" none]
+    let tomb := stamped (applyList State.empty [aheadWrite]) 1 1 990 "k" none
+    let node2 := runEvents State.empty [.write 2 1 1000 "k" (some [1]), .recv tomb]
+    tomb.metadata.timestamp = 1001 ∧
+    node1.1 "k" = some tomb ∧ node2.1 "k" = some tomb := by
   decide
 
 end Wavekv
