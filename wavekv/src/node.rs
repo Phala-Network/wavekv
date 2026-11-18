@@ -932,10 +932,17 @@ impl NodeState {
     // Writes
     // -----------------------------------------------------------------------
 
-    fn alloc_entry_meta(&mut self) -> Metadata {
+    /// Stamp a local write of `key` with wall time, but strictly above the entry
+    /// held for it: a write must beat what its writer has already seen, or it would
+    /// win here while losing on every peer, which already covers the held entry.
+    fn alloc_entry_meta(&mut self, key: &str) -> Metadata {
         let seq = self.core.next_seq();
         self.core.execute(StateOp::IncrementSeq);
-        let timestamp = Utc::now().timestamp_millis();
+        let now = Utc::now().timestamp_millis();
+        let timestamp = match self.core.data().get(key) {
+            Some(existing) => now.max(existing.meta.timestamp.saturating_add(1)),
+            None => now,
+        };
         Metadata::new(self.id, seq, timestamp)
     }
 
@@ -954,37 +961,20 @@ impl NodeState {
     }
 
     pub fn put(&mut self, key: String, value: impl Into<Vec<u8>>) -> Result<Entry> {
-        let meta = self.alloc_entry_meta();
+        let meta = self.alloc_entry_meta(&key);
         let entry = Entry::new(key, Some(value.into()), meta);
         self.execute_ops(vec![StateOp::Set(entry.clone())])?;
         self.record_own_write(&entry);
         Ok(entry)
     }
 
-    /// Write with a timestamp guaranteed to beat the current winner.
-    ///
-    /// The operator escape hatch for a key poisoned by a peer with a runaway clock:
-    /// plain `put` would lose LWW against a far-future stamp until real time catches up.
+    #[deprecated(since = "2.2.0", note = "`put` now always beats the current winner")]
     pub fn force_put(&mut self, key: String, value: impl Into<Vec<u8>>) -> Result<Entry> {
-        let seq = self.core.next_seq();
-        self.core.execute(StateOp::IncrementSeq);
-        let now = Utc::now().timestamp_millis();
-        let timestamp = match self.core.data().get(&key) {
-            Some(existing) => now.max(existing.meta.timestamp.saturating_add(1)),
-            None => now,
-        };
-        let entry = Entry::new(
-            key,
-            Some(value.into()),
-            Metadata::new(self.id, seq, timestamp),
-        );
-        self.execute_ops(vec![StateOp::Set(entry.clone())])?;
-        self.record_own_write(&entry);
-        Ok(entry)
+        self.put(key, value)
     }
 
     pub fn delete(&mut self, key: String) -> Result<Option<Entry>> {
-        let meta = self.alloc_entry_meta();
+        let meta = self.alloc_entry_meta(&key);
         let tombstone = Entry::new(key.clone(), None, meta);
         let previous = self.core.data().get(&key).cloned();
         self.execute_ops(vec![StateOp::Set(tombstone.clone())])?;

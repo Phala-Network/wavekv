@@ -759,7 +759,7 @@ fn a_runaway_clock_cannot_poison_a_key_permanently() {
 }
 
 #[test]
-fn force_put_recovers_a_key_poisoned_before_clamping_existed() {
+fn put_recovers_a_key_poisoned_before_clamping_existed() {
     use chrono::Utc;
     use wavekv::types::Metadata;
 
@@ -791,25 +791,8 @@ fn force_put_recovers_a_key_poisoned_before_clamping_existed() {
         Some(b"poison".to_vec())
     );
 
-    // A plain put is applied locally without an LWW check, so it *looks* like it
-    // worked — but the poisoned entry is still live on the peer, and the next round
-    // re-merges it and silently reverts the repair. That is the real failure mode.
+    // A put stamps above the current winner, so the repair survives re-delivery.
     node.write().put("k".into(), b"repair".to_vec()).unwrap();
-    assert_eq!(
-        node.read().get("k").unwrap().value,
-        Some(b"repair".to_vec())
-    );
-    node.write().apply_envelope(poison()).unwrap();
-    assert_eq!(
-        node.read().get("k").unwrap().value,
-        Some(b"poison".to_vec()),
-        "an honest timestamp loses to the future-stamped entry on every re-delivery"
-    );
-
-    // force_put stamps above the current winner, so the repair survives re-delivery.
-    node.write()
-        .force_put("k".into(), b"repair".to_vec())
-        .unwrap();
     node.write().apply_envelope(poison()).unwrap();
     assert_eq!(
         node.read().get("k").unwrap().value,
