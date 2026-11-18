@@ -92,6 +92,10 @@ pub struct NodeState {
     /// Keys written locally since the last opportunistic push (RFC 3.9).
     pending_push: Vec<String>,
 
+    /// Tombstones the previous GC call found collectable. Only these may be cleared
+    /// by the next call; see [`NodeState::collect_tombstone_garbage`].
+    gc_marked: HashMap<String, Metadata>,
+
     entries_merged: u64,
     entries_rejected: u64,
     /// Set while this node is bootstrapping, which suspends adoption of a *requester's*
@@ -1078,6 +1082,15 @@ impl NodeState {
     /// deleted key — for dstack-gateway, a deregistered CVM reappearing in every node's
     /// WireGuard config.
     ///
+    /// The watermark alone does not cover envelopes still in flight: one built by a
+    /// peer before it merged the tombstone, but delivered after the collection,
+    /// re-offers the deleted write against nothing and resurrects it. So collection is
+    /// two-phase: a tombstone is cleared only if the previous call already found it
+    /// collectable, which keeps it for one GC period after the watermark passes it. That
+    /// is safe as long as an envelope is delivered or dropped within one period. The
+    /// marks live in memory only, so a restart merely delays collection by one call,
+    /// and a cadence shared by every node (as dstack-gateway keeps) stays shared.
+    ///
     /// Caveat (accepted, documented): the watermark spans *known* peers, so a
     /// permanently retired peer pins GC until `remove_peer` is called for it — and then
     /// the opposite bites, because `remove_peer` also drops `acks[removed]`. Once every
@@ -1135,17 +1148,27 @@ impl NodeState {
             Some(low)
         };
 
-        let collectable: Vec<String> = self
+        let collectable: HashMap<String, Metadata> = self
             .core
             .data()
             .iter()
             .filter(|(_, entry)| entry.is_deleted())
             .filter(|(_, entry)| watermark(entry.meta.node).is_some_and(|w| w >= entry.meta.seq))
+            .map(|(key, entry)| (key.clone(), entry.meta))
+            .collect();
+        let marked = std::mem::replace(&mut self.gc_marked, collectable);
+        let due: Vec<String> = self
+            .gc_marked
+            .iter()
+            .filter(|(key, meta)| marked.get(*key) == Some(*meta))
             .map(|(key, _)| key.clone())
             .collect();
 
-        let removed = collectable.len();
-        self.execute_ops(collectable.into_iter().map(StateOp::Clear).collect())?;
+        let removed = due.len();
+        self.execute_ops(due.iter().cloned().map(StateOp::Clear).collect())?;
+        for key in &due {
+            self.gc_marked.remove(key);
+        }
         if removed > 0 {
             debug!("collected {removed} fully-replicated tombstones");
         }
@@ -1240,6 +1263,7 @@ impl Node {
             data_bytes: 0,
             config,
             pending_push: Vec::new(),
+            gc_marked: HashMap::new(),
             entries_merged: 0,
             entries_rejected: 0,
             bootstrap_pending: false,
@@ -1287,6 +1311,7 @@ impl Node {
             data_bytes: 0,
             config,
             pending_push: Vec::new(),
+            gc_marked: HashMap::new(),
             entries_merged: 0,
             entries_rejected: 0,
             bootstrap_pending: false,
