@@ -1,0 +1,8 @@
+name = "WavekvFormal"
+defaultTargets = ["WavekvFormal"]
+
+[leanOptions]
+warningAsError = true
+
+[[lean_lib]]
+name = "WavekvFormal"
