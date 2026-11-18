@@ -296,9 +296,13 @@ encoding-compatible:
   `max_clock_drift` (default: 5 minutes). This bounds the blast radius of a
   node with a runaway clock, which under raw LWW can poison keys unfixably
   until real time catches up.
-- **Administrative override.** A `force_put` API writes with
-  `timestamp = max(existing.timestamp + 1, now)`, providing an escape hatch
-  for operator repair of a poisoned key.
+- **Causal local writes.** `put` and `delete` stamp with
+  `timestamp = max(existing.timestamp + 1, now)`, so a write beats every entry
+  its writer has seen. A write stamped below the held entry would win locally
+  but lose on every peer that already covers that entry, leaving replicas
+  divergent until digest repair. This also lets a plain `put` repair a
+  poisoned key. (`force_put`, which first carried this rule as an operator
+  override, is now a deprecated alias of `put`.)
 
 Replacing `(timestamp, seq)` with a single hybrid logical clock is explicitly
 **deferred** to a post-migration RFC: it changes the `Metadata` encoding and
@@ -495,9 +499,8 @@ through in mixed failure scenarios.
 
 ```rust
 impl NodeState {
-    pub fn put(&mut self, key: String, value: impl Into<Vec<u8>>) -> Result<Entry>;   // unchanged
-    pub fn delete(&mut self, key: String) -> Result<Option<Entry>>;                    // unchanged
-    pub fn force_put(&mut self, key: String, value: impl Into<Vec<u8>>) -> Result<Entry>; // 3.5
+    pub fn put(&mut self, key: String, value: impl Into<Vec<u8>>) -> Result<Entry>;   // 3.5
+    pub fn delete(&mut self, key: String) -> Result<Option<Entry>>;                    // 3.5
     pub fn get / get_by_prefix / iter_by_prefix / watch_*                              // unchanged
 
     /// Build an outgoing envelope for `peer` (R4: one snapshot).
@@ -713,7 +716,7 @@ e2e harness is the reference environment):
    pagination, per-entry admission failures; assert INV via digest equality
    after quiescence (property-based where practical).
 7. Clock skew: a node with +1h wall clock; assert rejection bounds the damage
-   and `force_put` recovers a poisoned key.
+   and `put` recovers a poisoned key.
 
 ## 9. Performance notes
 

@@ -2654,3 +2654,54 @@ async fn a_write_outside_a_batch_is_appended_immediately() {
         "writes outside a merge round must each be durable when they return"
     );
 }
+
+/// A local write after merging a peer's entry stamped ahead of local wall time (a peer
+/// clock running fast, within `max_clock_drift`) must beat that entry. Stamped below
+/// it, the write would win locally and lose on every peer, and since the writer has
+/// already covered the peer's entry, no round would ever re-send it: the replicas
+/// would diverge until digest repair, and a node syncing through the writer would
+/// inherit both the stale value and the coverage claim.
+#[tokio::test]
+async fn a_local_write_beats_a_merged_entry_stamped_ahead_of_local_time() {
+    use crate::sync::SyncEnvelope;
+
+    let ahead = chrono::Utc::now().timestamp_millis() + 30_000;
+    let peer_entry = Entry::new(
+        "k".to_string(),
+        Some(b"b".to_vec()),
+        Metadata::new(2, 1, ahead),
+    );
+    let round = |from: &Node, to: &Node, to_id: NodeId| {
+        let request = from.read().prepare_sync(to_id, vec![]);
+        let response = to.write().handle_envelope(request, vec![]).unwrap();
+        from.write().apply_envelope(response).unwrap()
+    };
+
+    for delete in [false, true] {
+        let a = Node::new(1, vec![2, 3]);
+        let b = Node::new(2, vec![1, 3]);
+        let c = Node::new(3, vec![1, 2]);
+        b.write().sync(peer_entry.clone()).unwrap();
+        let mut envelope = SyncEnvelope::new(2, vec![]);
+        envelope.entries.push(peer_entry.clone());
+        envelope.acks.insert(2, 1);
+        a.write().apply_envelope(envelope).unwrap();
+
+        if delete {
+            a.write().delete("k".to_string()).unwrap();
+        } else {
+            a.write().put("k".to_string(), b"a".to_vec()).unwrap();
+        }
+        let expected = (!delete).then(|| b"a".to_vec());
+
+        assert_eq!(round(&a, &b, 2).digest_match, Some(true));
+        round(&c, &a, 1);
+        assert_eq!(round(&c, &b, 2).digest_match, Some(true));
+        for node in [&a, &b, &c] {
+            assert_eq!(
+                node.read().get("k").map(|e| e.value),
+                expected.clone().map(Some)
+            );
+        }
+    }
+}
