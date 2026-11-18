@@ -507,7 +507,7 @@ async fn tombstone_gc_waits_for_every_peer_to_cover_the_delete() {
     use crate::sync::SyncEnvelope;
 
     let store = Node::new(1, vec![2]);
-    store
+    let put_entry = store
         .write()
         .put("key1".to_string(), "value1".to_string())
         .unwrap();
@@ -530,10 +530,28 @@ async fn tombstone_gc_waits_for_every_peer_to_cover_the_delete() {
     store.write().handle_envelope(behind, vec![]).unwrap();
     assert_eq!(store.write().collect_tombstone_garbage().unwrap(), 0);
 
-    // ... and finally past it.
-    let mut caught_up = SyncEnvelope::new(2, vec![]);
-    caught_up.acks.insert(1, tombstone.meta.seq);
-    store.write().handle_envelope(caught_up, vec![]).unwrap();
+    // ... and finally past it. The tombstone is kept for one more GC call, so an
+    // envelope peer 2 built before it merged the delete, delivered late, still meets
+    // it; carrying the older ack map, it also pushes collection back.
+    let caught_up = || {
+        let mut env = SyncEnvelope::new(2, vec![]);
+        env.acks.insert(1, tombstone.meta.seq);
+        env
+    };
+    store.write().handle_envelope(caught_up(), vec![]).unwrap();
+    assert_eq!(store.write().collect_tombstone_garbage().unwrap(), 0);
+    let mut stale = SyncEnvelope::new(2, vec![]);
+    stale.entries.push(put_entry);
+    stale.acks.insert(1, tombstone.meta.seq - 1);
+    store.write().apply_envelope(stale).unwrap();
+    assert!(
+        store.read().get("key1").is_none(),
+        "the stale write must lose"
+    );
+    assert_eq!(store.write().collect_tombstone_garbage().unwrap(), 0);
+
+    store.write().handle_envelope(caught_up(), vec![]).unwrap();
+    assert_eq!(store.write().collect_tombstone_garbage().unwrap(), 0);
     assert_eq!(store.write().collect_tombstone_garbage().unwrap(), 1);
     assert!(store.read().get_including_tombstones("key1").is_none());
 }

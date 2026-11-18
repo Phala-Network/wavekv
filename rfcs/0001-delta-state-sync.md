@@ -489,6 +489,14 @@ removed: under any state-shipping scheme, uncoordinated GC lets a lagging
 replica resurrect deleted keys — in dstack-gateway terms, a deregistered CVM
 reappearing in every node's WireGuard config.
 
+The watermark does not cover envelopes still in flight: one built before its
+sender merged the tombstone but delivered after the collection re-offers the
+deleted write against nothing. Collection is therefore two-phase: a tombstone is
+cleared only if the previous GC call already found it collectable, which keeps it
+for one GC period after the watermark passes it. This is safe while every
+envelope is delivered or dropped within one period. The marks are in memory
+only; a restart just delays collection by one call.
+
 Caveat (documented, accepted): the watermark is computed over *known* peers. A
 peer that is permanently retired must be removed via `remove_peer`, or it pins
 GC forever; a node offline longer than its own membership record re-bootstraps
